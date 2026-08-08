@@ -1,0 +1,195 @@
+# IO Development Journal
+
+## Scope
+
+This journal records the staged IO performance work after the initial benchmark run. The work is intentionally split into independently reviewable changes and must remain uncommitted until reviewed by the repository owner. No pull request is to be created from this work.
+
+## Baseline
+
+The benchmark results in `io-benchmark-results.txt` are fast-profile Criterion medians from a single-process run. Each payload benchmark constructs a fresh Stak VM per iteration, so the timings include VM setup, Scheme execution, data construction, and filesystem work.
+
+The important 100k observations are:
+
+- `make-bytevector`: 258.94 ms preparation.
+- In-memory bytevector input preparation: 265.14 ms.
+- In-memory bytevector output preparation: 258.75 ms.
+- OS bytevector output preparation: 256.14 ms.
+- In-memory bytevector read/write: 694.64/390.44 ms.
+- OS bytevector read/write: 433.04/503.08 ms.
+- In-memory UTF-8 string read/write: 531.44/709.95 ms.
+
+The benchmark therefore exposes two independent costs:
+
+1. `OsFileSystem` performs scalar host reads and writes, causing avoidable syscall overhead.
+2. Bytevectors, strings, ports, and their intermediate lists use expensive Scheme-level construction and traversal. Buffering cannot fix this representation cost.
+
+## First change: buffered `OsFileSystem`
+
+The first implementation change keeps the public scalar `FileSystem` trait and Scheme port API unchanged. `OsFileSystem` will store input files in `BufReader<File>` and output files in `BufWriter<File>`.
+
+Required behavior:
+
+- Scalar reads and writes continue to have the same observable results.
+- Explicit output `flush` makes buffered bytes visible.
+- Successful `close` flushes output before dropping the descriptor.
+- A failed close-time flush must not silently discard the descriptor state.
+- Invalid descriptors and wrong-direction operations remain errors according to the existing backend contract.
+- No changes are made to `LibcFileSystem`, VM representation, bytevectors, or Scheme ports in this change.
+
+This change is deliberately useful but not expected to solve the benchmark by itself.
+
+## Follow-up performance changes
+
+1. Add a native `make-bytevector` builder that constructs the existing tag-8 factor-64 representation without Scheme-level repeated `vector-push!` operations.
+2. Change in-memory bytevector ports to retain source-plus-position state instead of eagerly converting the source to a list; accumulate output chunks and combine them only when requested.
+3. Apply the analogous source-position/chunk strategy to string ports, with UTF-8 decoding and encoding reviewed independently from the already-open correctness PR #3949.
+4. Add native bulk port/filesystem operations only after the representation and port changes have been measured.
+5. Defer compact raw bytevector objects, collector changes, and broad VM redesign until allocation and representation telemetry justifies them.
+
+Vector's `../vector` runtime is design evidence for the later Vector-owned fast paths: it uses 64 KiB buffered descriptors, direct construction of Stak's existing bytevector tree, source-position in-memory ports, chunked output, and scalar fallback for generic ports.
+
+## Review boundary
+
+The first reviewable patch is limited to `file/src/file_system/os.rs` and its focused tests. It must not be committed or pushed until reviewed.
+
+## 2026-08-08 - Buffered backend implemented locally
+
+- Replaced `OsFileSystem`'s descriptor map values with 64 KiB `BufReader<File>` and `BufWriter<File>` handles.
+- Kept the scalar `FileSystem` trait unchanged.
+- Added explicit output flushing on `flush` and successful `close`.
+- If close-time flushing fails, the descriptor is restored to the map instead of being silently discarded.
+- Added focused tests for multi-buffer reads, close-time write persistence, wrong-direction access, and invalid descriptors.
+- The enabled OS test module passes: 10 tests.
+- `cargo fmt --all -- --check` passes.
+
+The change remains uncommitted and no PR has been created.
+
+### Validation update
+
+- `cargo check -p stak-file` passes.
+- `cargo test -p stak-file --features std` passes: 13 tests.
+- `cargo test -p stak --features std --lib` passes as a downstream compilation check; the root library has no unit tests.
+- Targeted Clippy and formatting checks remain part of the review gate.
+- A workspace-wide test attempt was cancelled because it was too slow; it is not required for this focused patch.
+
+### Final focused validation
+
+- `cargo clippy -p stak-file --features std --all-targets -- -D warnings` passes.
+- `cargo test -p stak-file --features std --lib` passes: 13 tests.
+- `cargo check -p stak-file` passes.
+- `cargo fmt --all -- --check` and `git diff --check` pass.
+- The workspace-wide test command was intentionally not repeated after cancellation; the focused package and downstream root-library checks are the validation used for this review boundary.
+
+## 2026-08-08 - Native `make-bytevector` implemented locally
+
+- Added primitive number `600` as `MAKE_BYTEVECTOR` and dispatched it from `SmallPrimitiveSet`.
+- Replaced the Scheme-level `make-vector` construction path with a native constructor while preserving the existing tag-8 bytevector representation: the outer rib stores the length and the cdr stores the factor-64 vector tree.
+- The builder recursively creates filled leaves and internal nodes with existing `Memory::cons`/`Memory::allocate` APIs and keeps intermediate nodes on the VM stack as allocation roots. No representation or collector changes were made.
+- Numeric validation accepts nonnegative integral lengths and fill bytes in `0..=255`; invalid numeric values are reported through the existing VM error wrapper.
+- The optional fill remains provided by the Scheme wrapper, defaulting to zero.
+
+### Native bytevector validation
+
+- Corrected boundary probe passed for lengths `0`, `1`, `63`, `64`, `65`, `4096`, and `4097`, including fill values, mutation, length checks, and post-construction reads.
+- Added `features/types/bytevector.feature` coverage for an empty bytevector and filled/mutated vectors at the 64- and 4096-element tree boundaries.
+- `./tools/integration_test.sh -f std -i stak features/types/bytevector.feature` passed.
+- `cargo test -p stak-r7rs --lib` passed; the crate currently has zero unit tests.
+- `cargo check -p stak-r7rs --no-default-features` passed, covering the no-std-compatible numeric validation path.
+- `cargo clippy -p stak-r7rs --all-targets -- -D warnings` passed.
+- `cargo test -p stak --features std --lib` passed as a downstream compilation check.
+- A forced-GC interpreter probe exposed an existing unrelated failure: even a scalar-only `(= (+ 1 2) 3)` program panics in `Vm::run_async` under `stak-interpret --features gc_always`, so it cannot currently serve as native-builder-specific evidence.
+
+### IO benchmark comparison
+
+Command:
+
+```sh
+cargo bench -p stak-bench --bench io --locked -- \
+  --sample-size 10 --warm-up-time 0.2 --measurement-time 0.5
+```
+
+Current Criterion medians at 100k, compared with the recorded baseline:
+
+| Case | Baseline | Current | Change |
+| --- | ---: | ---: | ---: |
+| In-memory `make-bytevector` preparation | 258.94 ms | 0.629 ms | -99.8% |
+| In-memory input-bytevector preparation | 265.14 ms | 6.746 ms | -97.5% |
+| In-memory output-bytevector preparation | 258.75 ms | 0.538 ms | -99.8% |
+| OS output-bytevector preparation | 256.14 ms | 0.476 ms | -99.8% |
+| In-memory bytevector read | 694.64 ms | 441.372 ms | -36.5% |
+| In-memory bytevector write | 390.44 ms | 130.301 ms | -66.6% |
+| OS bytevector read | 433.04 ms | 394.514 ms | -8.9% |
+| OS bytevector write | 503.08 ms | 121.112 ms | -75.9% |
+
+The benchmark used the same fast 10-sample profile as the baseline. The native constructor removes most of the former Scheme-level construction cost; remaining payload costs include the unchanged bytevector traversal and port operations.
+
+All changes remain uncommitted and no pull request has been created.
+
+## 2026-08-08 - Codex review fixes for native `make-bytevector`
+
+Codex identified two blocking correctness issues in the initial native constructor:
+
+- The recursive builder pushed a completed list as a GC root but returned the pre-GC local pointer. The caller could therefore use a stale semispace address after `memory.push` triggered copying collection.
+- Argument extraction used `memory.pop_numbers()`, whose `assume_number` path can panic for public Scheme values such as `#f`.
+
+Fixes:
+
+- After pushing each completed leaf or internal node, the builder now retrieves the relocated value from `memory.top()` before returning it.
+- The primitive now pops ordinary `Value`s and converts them with `Number::try_from`, propagating `NumberExpected` through the existing R7RS error wrapper before range validation.
+
+Regression coverage added:
+
+- A direct primitive-layer test constructs a length-1 bytevector with a 24-value heap, forcing the small-heap copying-GC path and validating the resulting outer bytevector object.
+- Direct primitive tests cover nonnumeric length and fill arguments.
+- Feature coverage catches both public Scheme-level nonnumeric argument cases with `guard`.
+
+Validation after the fixes:
+
+- `cargo test -p stak-r7rs --lib`: 3 tests passed.
+- `cargo clippy -p stak-r7rs --all-targets -- -D warnings`: passed.
+- `cargo check -p stak-r7rs --no-default-features`: passed.
+- `cargo test -p stak --features std --lib`: passed.
+- `./tools/integration_test.sh -f std -i stak features/types/bytevector.feature`: passed.
+- `cargo fmt --all -- --check` and `git diff --check`: passed.
+
+The benchmark results remain the earlier native-constructor measurements; this correction only changes GC-root recovery and argument failure handling, not the representation or normal allocation path.
+
+## 2026-08-08 - Post-review benchmark rerun
+
+The IO benchmark was rerun after the GC-root and nonnumeric-argument fixes with the same command and fast profile:
+
+```sh
+cargo bench -p stak-bench --bench io --locked -- \
+  --sample-size 10 --warm-up-time 0.2 --measurement-time 0.5
+```
+
+Current Criterion medians:
+
+| Case | 10k | 100k |
+| --- | ---: | ---: |
+| In-memory `make-bytevector` preparation | 0.486 ms | 0.546 ms |
+| In-memory input-bytevector preparation | 1.014 ms | 6.653 ms |
+| In-memory output-bytevector preparation | 0.433 ms | 0.591 ms |
+| In-memory bytevector read | 31.499 ms | 440.776 ms |
+| In-memory bytevector write | 12.110 ms | 130.081 ms |
+| OS input-bytevector preparation | 0.514 ms | 0.502 ms |
+| OS output-bytevector preparation | 0.315 ms | 0.453 ms |
+| OS bytevector read | 29.975 ms | 394.419 ms |
+| OS bytevector write | 11.417 ms | 117.660 ms |
+
+The correctness fixes do not introduce a material normal-path regression relative to the prior native-constructor run. The short 10-sample profile remains subject to normal Criterion variance.
+
+## 2026-08-08 - Async test compatibility fix
+
+Codex found that the new direct primitive tests called the `#[maybe_async]`-transformed `operate` method synchronously, so they failed to compile with the supported `async` feature.
+
+- Added `stak-util` as an r7rs dev-dependency.
+- Wrapped test primitive calls with the repository-standard `stak_util::block_on!` macro, making the tests work in both synchronous and asynchronous configurations.
+
+Validation:
+
+- `cargo test -p stak-r7rs --lib`: 3 tests passed.
+- `cargo test -p stak-r7rs --features async --lib --no-run`: passed.
+- `cargo test -p stak-r7rs --features async --lib`: 3 tests passed.
+- `cargo clippy -p stak-r7rs --all-targets -- -D warnings`: passed.
+- `cargo clippy -p stak-r7rs --features async --all-targets -- -D warnings`: passed.

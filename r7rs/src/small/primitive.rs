@@ -53,6 +53,7 @@ pub(super) enum Primitive {
     Acos,
     Asin,
     Atan,
+    MakeBytevector = 600,
 }
 
 impl Primitive {
@@ -109,4 +110,5 @@ impl Primitive {
     pub const ACOS: usize = Self::Acos as _;
     pub const ASIN: usize = Self::Asin as _;
     pub const ATAN: usize = Self::Atan as _;
+    pub const MAKE_BYTEVECTOR: usize = Self::MakeBytevector as _;
 }

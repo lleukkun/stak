@@ -30,3 +30,6 @@ async = [
   "stak-vm/async",
   "winter-maybe-async/async",
 ]
+
+[dev-dependencies]
+stak-util = { path = "../util" }

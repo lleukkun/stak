@@ -143,6 +143,64 @@ Feature: Bytevector
       | 0 1 2 3   | 1 #u8(4 5 6 7) 1   | AFGH   |
       | 0 1 2 3   | 1 #u8(4 5 6 7) 1 3 | AFGD   |
 
+  Scenario: Make an empty bytevector
+    Given a file named "main.scm" with:
+      """scheme
+      (import (scheme base))
+
+      (write-u8 (if (= (bytevector-length (make-bytevector 0))) 65 66))
+      """
+    When I successfully run `stak main.scm`
+    Then the stdout should contain exactly "A"
+
+  Scenario Outline: Make and mutate a filled bytevector
+    Given a file named "main.scm" with:
+      """scheme
+      (import (scheme base))
+
+      (define xs (make-bytevector <length> <fill>))
+
+      (bytevector-u8-set! xs <index> 65)
+
+      (write-u8
+        (if (and (= (bytevector-length xs) <length>)
+                 (= (bytevector-u8-ref xs <index>) 65)
+                 (= (bytevector-u8-ref xs 0) <first>))
+            65
+            66))
+      """
+    When I successfully run `stak main.scm`
+    Then the stdout should contain exactly "A"
+
+    Examples:
+      | length | fill | index | first |
+      | 1      | 0    | 0     | 65    |
+      | 63     | 37   | 62    | 37    |
+      | 64     | 37   | 63    | 37    |
+      | 65     | 255  | 64    | 255   |
+      | 4096   | 37   | 4095  | 37    |
+      | 4097   | 255  | 4096  | 255   |
+
+  Scenario Outline: Reject nonnumeric make-bytevector arguments
+    Given a file named "main.scm" with:
+      """scheme
+      (import (scheme base))
+
+      (write-u8
+        (if (guard
+              (condition (else #t))
+              (begin (make-bytevector <length> <fill>) #f))
+            65
+            66))
+      """
+    When I successfully run `stak main.scm`
+    Then the stdout should contain exactly "A"
+
+    Examples:
+      | length | fill |
+      | #f     | 0    |
+      | 1      | #f   |
+
   @long
   Rule: Large bytevector
 

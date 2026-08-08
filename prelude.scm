@@ -1699,7 +1699,9 @@
     (define bytevector-u8-ref vector-ref)
     (define bytevector-u8-set! vector-set!)
     (define list->bytevector (construct-bytevector list->vector))
-    (define make-bytevector (construct-bytevector make-vector))))
+    (define $make-bytevector (primitive 600))
+    (define (make-bytevector length . rest)
+      ($make-bytevector length (if (null? rest) 0 (car rest))))))
 
 (define-library (stak string)
   (export

@@ -1698,6 +1698,7 @@ dependencies = [
  "stak-native",
  "stak-process-context",
  "stak-time",
+ "stak-util",
  "stak-vm",
  "winter-maybe-async",
 ]

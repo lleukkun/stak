@@ -15,6 +15,9 @@ use stak_time::{Clock, TimePrimitiveSet};
 use stak_vm::{Heap, Memory, Number, PrimitiveSet, Tag, Type, Value};
 use winter_maybe_async::{maybe_async, maybe_await};
 
+const BYTEVECTOR_TAG: Tag = 8;
+const VECTOR_FACTOR: usize = 64;
+
 /// A primitive set that covers [the R7RS small](https://standards.scheme.org/corrected-r7rs/r7rs.html).
 pub struct SmallPrimitiveSet<D: Device, F: FileSystem, P: ProcessContext, C: Clock> {
     device: DevicePrimitiveSet<D>,
@@ -100,6 +103,102 @@ impl<D: Device, F: FileSystem, P: ProcessContext, C: Clock> SmallPrimitiveSet<D,
 
         Ok(())
     }
+
+    fn make_bytevector<H: Heap>(memory: &mut Memory<H>) -> Result<(), Error> {
+        let [length, fill] = memory.pop_many()?;
+        let length = Self::nonnegative_integer(Number::try_from(length)?)?;
+        let fill = Self::byte(Number::try_from(fill)?)?;
+        let root = if length == 0 {
+            memory.null()?
+        } else {
+            let root = build_filled_vector_node(memory, 0, length, vector_height(length), fill)?;
+            let bytevector = memory.allocate(
+                Number::from_i64(length as _).into(),
+                root.set_tag(BYTEVECTOR_TAG).into(),
+            )?;
+            let _ = memory.pop()?;
+            memory.push(bytevector.into())?;
+            return Ok(());
+        };
+
+        let bytevector = memory.allocate(
+            Number::from_i64(length as _).into(),
+            root.set_tag(BYTEVECTOR_TAG).into(),
+        )?;
+        memory.push(bytevector.into())?;
+
+        Ok(())
+    }
+
+    fn nonnegative_integer(number: Number) -> Result<usize, Error> {
+        let float = number.to_f64();
+        let integer = number.to_i64();
+        if float != integer as f64 || integer < 0 {
+            return Err(stak_vm::Error::NumberExpected.into());
+        }
+
+        Ok(usize::try_from(integer as u64).map_err(|_| stak_vm::Error::NumberExpected)?)
+    }
+
+    fn byte(number: Number) -> Result<u8, Error> {
+        let number = Self::nonnegative_integer(number)?;
+        Ok(u8::try_from(number).map_err(|_| stak_vm::Error::NumberExpected)?)
+    }
+}
+
+fn vector_height(mut length: usize) -> usize {
+    let mut height = 0;
+
+    while length > VECTOR_FACTOR {
+        length = 1 + (length - 1) / VECTOR_FACTOR;
+        height += 1;
+    }
+
+    height
+}
+
+fn vector_capacity(height: usize) -> usize {
+    (0..height).fold(1, |capacity, _| capacity.saturating_mul(VECTOR_FACTOR))
+}
+
+fn build_filled_vector_node<H: Heap>(
+    memory: &mut Memory<H>,
+    start: usize,
+    end: usize,
+    height: usize,
+    fill: u8,
+) -> Result<stak_vm::Cons, Error> {
+    if height == 0 {
+        let mut list = memory.null()?;
+        let fill = Number::from_i64(i64::from(fill)).into();
+
+        for _ in start..end {
+            list = memory.cons(fill, list)?;
+        }
+
+        memory.push(list.into())?;
+        return Ok(memory.top()?.assume_cons());
+    }
+
+    let capacity = vector_capacity(height);
+    let mut cursor = start;
+    let mut children = 0;
+
+    while cursor < end {
+        let child_end = cursor.saturating_add(capacity).min(end);
+        build_filled_vector_node(memory, cursor, child_end, height - 1, fill)?;
+        children += 1;
+        cursor = child_end;
+    }
+
+    let mut list = memory.null()?;
+    for _ in 0..children {
+        let child = memory.pop()?;
+        list = memory.cons(child, list)?;
+    }
+
+    memory.push(list.into())?;
+    Ok(memory.top()?.assume_cons())
 }
 
 impl<H: Heap, D: Device, F: FileSystem, P: ProcessContext, C: Clock> PrimitiveSet<H>
@@ -149,6 +248,7 @@ impl<H: Heap, D: Device, F: FileSystem, P: ProcessContext, C: Clock> PrimitiveSe
             Primitive::REMAINDER => memory.try_operate_binary(Number::remainder)?,
             Primitive::EXPT => memory.operate_binary(Number::power)?,
             Primitive::HALT => return Err(Error::Halt),
+            Primitive::MAKE_BYTEVECTOR => Self::make_bytevector(memory)?,
             Primitive::NULL | Primitive::PAIR => {
                 maybe_await!(self.type_check.operate(memory, primitive - Primitive::NULL))?
             }
@@ -204,5 +304,73 @@ impl<H: Heap, D: Device, F: FileSystem, P: ProcessContext, C: Clock> PrimitiveSe
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use stak_device::VoidDevice;
+    use stak_file::VoidFileSystem;
+    use stak_process_context::VoidProcessContext;
+    use stak_time::VoidClock;
+    use stak_util::block_on;
+
+    type TestPrimitiveSet =
+        SmallPrimitiveSet<VoidDevice, VoidFileSystem, VoidProcessContext, VoidClock>;
+
+    fn primitive_set() -> TestPrimitiveSet {
+        SmallPrimitiveSet::new(
+            VoidDevice::new(),
+            VoidFileSystem::new(),
+            VoidProcessContext::new(),
+            VoidClock::new(),
+        )
+    }
+
+    #[test]
+    fn make_bytevector_relocates_the_filled_root() {
+        let mut memory = Memory::new([Default::default(); 24]).unwrap();
+        memory.push(Number::from_i64(1).into()).unwrap();
+        memory.push(Number::from_i64(37).into()).unwrap();
+
+        block_on!(primitive_set().operate(&mut memory, Primitive::MAKE_BYTEVECTOR)).unwrap();
+
+        let bytevector = memory.pop().unwrap();
+        assert_eq!(
+            memory
+                .car_value(bytevector)
+                .unwrap()
+                .assume_number()
+                .to_i64(),
+            1
+        );
+        assert_eq!(memory.cdr_value(bytevector).unwrap().tag(), BYTEVECTOR_TAG);
+    }
+
+    #[test]
+    fn make_bytevector_rejects_nonnumeric_length() {
+        let mut memory = Memory::new([Default::default(); 64]).unwrap();
+        let false_value = memory.boolean(false).unwrap();
+        memory.push(false_value.into()).unwrap();
+        memory.push(Number::from_i64(0).into()).unwrap();
+
+        assert_eq!(
+            block_on!(primitive_set().operate(&mut memory, Primitive::MAKE_BYTEVECTOR)),
+            Err(Error::Vm(stak_vm::Error::NumberExpected))
+        );
+    }
+
+    #[test]
+    fn make_bytevector_rejects_nonnumeric_fill() {
+        let mut memory = Memory::new([Default::default(); 64]).unwrap();
+        let false_value = memory.boolean(false).unwrap();
+        memory.push(Number::from_i64(1).into()).unwrap();
+        memory.push(false_value.into()).unwrap();
+
+        assert_eq!(
+            block_on!(primitive_set().operate(&mut memory, Primitive::MAKE_BYTEVECTOR)),
+            Err(Error::Vm(stak_vm::Error::NumberExpected))
+        );
     }
 }
