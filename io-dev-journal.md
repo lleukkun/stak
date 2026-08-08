@@ -193,3 +193,38 @@ Validation:
 - `cargo test -p stak-r7rs --features async --lib`: 3 tests passed.
 - `cargo clippy -p stak-r7rs --all-targets -- -D warnings`: passed.
 - `cargo clippy -p stak-r7rs --features async --all-targets -- -D warnings`: passed.
+
+## 2026-08-08 - In-memory bytevector ports optimized locally
+
+- Changed `open-input-bytevector` to retain the source bytevector and a read index instead of eagerly converting the source with `bytevector->list`.
+- Preserved scalar `read-u8`, `peek-u8`, EOF, and generic port buffering behavior.
+- Changed `open-output-bytevector` to write into 64-byte bytevector chunks with `bytevector-u8-set!`; a chunk is consed only when full instead of consing once per byte.
+- Output retrieval now finalizes a fresh bytevector by copying completed chunks and the partial chunk. Repeated retrievals produce equivalent results, and the port remains writable afterward.
+- The port data field stores a finalizer thunk; `get-output-bytevector` invokes that thunk.
+
+### Bytevector-port validation
+
+- Added a port scenario covering output across the 64-byte boundary, repeated retrieval, continued writing, and partial output.
+- Added a port scenario covering input indices `0`, `63`, and `64`, followed by repeated EOF reads.
+- `./tools/integration_test.sh -f std -i stak features/types/port.feature`: 24 scenarios and 75 steps passed.
+- `./tools/integration_test.sh -f std -i stak features/read.feature`: 93 scenarios and 479 steps passed.
+- `cargo test -p stak-r7rs --locked`: 3 tests passed.
+- `cargo fmt --all -- --check` and `git diff --check` passed.
+
+### Clean IO benchmark rerun
+
+The first post-change benchmark run showed implausible regressions because another project was building concurrently. After that build completed, the benchmark was rerun with the established command:
+
+```sh
+cargo bench -p stak-bench --bench io --locked -- \
+  --sample-size 10 --warm-up-time 0.2 --measurement-time 0.5
+```
+
+The clean rerun showed no material regression for in-memory bytevector ports:
+
+| Case | 10k change | 100k change |
+| --- | ---: | ---: |
+| In-memory bytevector read | +0.32% | -1.23% |
+| In-memory bytevector write | -0.44% | -0.79% |
+
+Preparation measurements were statistically unchanged as well. The changes remain uncommitted and the unrelated untracked files remain preserved.

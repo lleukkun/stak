@@ -2424,29 +2424,55 @@
     (define get-output-string port-data)
 
     (define (open-input-bytevector xs)
-      (let ((xs (bytevector->list xs)))
+      (let ((index 0)
+            (length (bytevector-length xs)))
         (make-input-port
           (lambda ()
-            (and
-              (pair? xs)
-              (let ((x (car xs)))
-                (set! xs (cdr xs))
-                x)))
+            (if (< index length)
+              (let ((x (bytevector-u8-ref xs index)))
+                (set! index (+ index 1))
+                x)
+              #f))
           (lambda () #f))))
 
+    (define bytevector-output-chunk-size 64)
+
     (define (open-output-bytevector)
-      (let* ((xs (bytevector))
-             (tail xs))
+      (let ((chunks '())
+            (chunk (make-bytevector bytevector-output-chunk-size 0))
+            (index 0)
+            (length 0))
         (make-output-port
           (lambda (x)
-            (set-car! xs (+ (bytevector-length xs) 1))
-            (set-cdr! tail (list x))
-            (set! tail (cdr tail)))
+            (bytevector-u8-set! chunk index x)
+            (set! index (+ index 1))
+            (set! length (+ length 1))
+            (when (= index bytevector-output-chunk-size)
+              (set! chunks (cons chunk chunks))
+              (set! chunk (make-bytevector bytevector-output-chunk-size 0))
+              (set! index 0)))
           (lambda () #f)
           (lambda () #f)
-          xs)))
+          (lambda ()
+            (let ((xs (make-bytevector length 0)))
+              (do ((chunks (reverse chunks) (cdr chunks))
+                   (offset 0 (+ offset bytevector-output-chunk-size)))
+                ((null? chunks)
+                  (when (positive? index)
+                    (bytevector-copy! xs offset chunk 0 index))
+                  xs)
+                (bytevector-copy!
+                  xs
+                  offset
+                  (car chunks)
+                  0
+                  bytevector-output-chunk-size)))))))
 
-    (define get-output-bytevector port-data)))
+    (define (get-output-bytevector port)
+      (let ((get (port-data port)))
+        (get)))
+
+    ))
 
 (define-library (stak unicode)
   (export string->utf8 utf8->string)

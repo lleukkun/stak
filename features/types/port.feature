@@ -214,3 +214,71 @@ Feature: Port
       | 65       | A      | 1      |
       | 65 66    | AB     | 2      |
       | 65 66 67 | ABC    | 3      |
+
+  Scenario: Preserve chunked bytevector output across retrievals
+    Given a file named "main.scm" with:
+      """scheme
+      (import (scheme base))
+
+      (define port (open-output-bytevector))
+
+      (do ((index 0 (+ index 1)))
+        ((= index 65))
+        (write-u8 index port))
+
+      (define first (get-output-bytevector port))
+      (define first-length (bytevector-length first))
+      (define first-at-zero (bytevector-u8-ref first 0))
+      (define first-at-63 (bytevector-u8-ref first 63))
+      (define first-at-64 (bytevector-u8-ref first 64))
+      (define second (get-output-bytevector port))
+      (define same-output? (equal? first second))
+
+      (write-u8 65 port)
+      (define third (get-output-bytevector port))
+
+      (write-u8
+        (if (and (= first-length 65)
+                 (= first-at-zero 0)
+                 (= first-at-63 63)
+                 (= first-at-64 64)
+                 same-output?
+                 (= (bytevector-length third) 66)
+                 (= (bytevector-u8-ref third 65) 65))
+            65
+            66))
+      """
+    When I successfully run `stak main.scm`
+    Then the stdout should contain exactly "A"
+
+  Scenario: Read a bytevector port across the chunk boundary
+    Given a file named "main.scm" with:
+      """scheme
+      (import (scheme base))
+
+      (define source (make-bytevector 65 255))
+      (bytevector-u8-set! source 0 0)
+      (bytevector-u8-set! source 63 63)
+      (bytevector-u8-set! source 64 64)
+
+      (define port (open-input-bytevector source))
+      (define at-zero (read-u8 port))
+      (do ((index 1 (+ index 1)))
+        ((= index 63))
+        (read-u8 port))
+      (define at-63 (read-u8 port))
+      (define at-64 (read-u8 port))
+      (define eof (read-u8 port))
+      (define eof-again (read-u8 port))
+
+      (write-u8
+        (if (and (= at-zero 0)
+                 (= at-63 63)
+                 (= at-64 64)
+                 (eof-object? eof)
+                 (eof-object? eof-again))
+            65
+            66))
+      """
+    When I successfully run `stak main.scm`
+    Then the stdout should contain exactly "A"
