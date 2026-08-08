@@ -5,17 +5,24 @@ use stak_vm::{Heap, Memory, Value};
 use std::{
     collections::HashMap,
     fs::{File, OpenOptions, remove_file},
-    io::{self, ErrorKind, Read, Write},
+    io::{self, BufReader, BufWriter, ErrorKind, Read, Write},
     path::{Path, PathBuf},
 };
 
+const BUFFER_SIZE: usize = 64 * 1024;
 const PATH_SIZE: usize = 256;
+
+#[derive(Debug)]
+enum OpenFile {
+    Input(BufReader<File>),
+    Output(BufWriter<File>),
+}
 
 /// A file system on an operating system.
 #[derive(Debug, Default)]
 pub struct OsFileSystem {
     descriptor: FileDescriptor,
-    files: HashMap<FileDescriptor, File>,
+    files: HashMap<FileDescriptor, OpenFile>,
 }
 
 impl OsFileSystem {
@@ -24,7 +31,7 @@ impl OsFileSystem {
         Self::default()
     }
 
-    fn file_mut(&mut self, descriptor: FileDescriptor) -> Result<&mut File, io::Error> {
+    fn file_mut(&mut self, descriptor: FileDescriptor) -> Result<&mut OpenFile, io::Error> {
         self.files
             .get_mut(&descriptor)
             .ok_or_else(|| io::Error::new(ErrorKind::InvalidData, "corrupted file descriptor"))
@@ -44,6 +51,11 @@ impl FileSystem for OsFileSystem {
             .truncate(output)
             .open(path)?;
         let descriptor = self.descriptor;
+        let file = if output {
+            OpenFile::Output(BufWriter::with_capacity(BUFFER_SIZE, file))
+        } else {
+            OpenFile::Input(BufReader::with_capacity(BUFFER_SIZE, file))
+        };
 
         self.files.insert(descriptor, file);
         self.descriptor = self.descriptor.wrapping_add(1);
@@ -52,28 +64,55 @@ impl FileSystem for OsFileSystem {
     }
 
     fn close(&mut self, descriptor: FileDescriptor) -> Result<(), Self::Error> {
-        self.files.remove(&descriptor);
+        let Some(mut file) = self.files.remove(&descriptor) else {
+            return Ok(());
+        };
+
+        let result = match &mut file {
+            OpenFile::Input(_) => Ok(()),
+            OpenFile::Output(writer) => writer.flush(),
+        };
+
+        if let Err(error) = result {
+            self.files.insert(descriptor, file);
+            return Err(error);
+        }
 
         Ok(())
     }
 
     fn read(&mut self, descriptor: FileDescriptor) -> Result<Option<u8>, Self::Error> {
+        let file = self.file_mut(descriptor)?;
+        let OpenFile::Input(reader) = file else {
+            return Err(io::Error::new(
+                ErrorKind::InvalidInput,
+                "cannot read from an output file",
+            ));
+        };
         let mut buffer = [0u8; 1];
-        let count = self.file_mut(descriptor)?.read(&mut buffer)?;
+        let count = reader.read(&mut buffer)?;
 
         Ok((count > 0).then_some(buffer[0]))
     }
 
     fn write(&mut self, descriptor: FileDescriptor, byte: u8) -> Result<(), Self::Error> {
         let file = self.file_mut(descriptor)?;
-        file.write_all(&[byte])?;
+        let OpenFile::Output(writer) = file else {
+            return Err(io::Error::new(
+                ErrorKind::InvalidInput,
+                "cannot write to an input file",
+            ));
+        };
+        writer.write_all(&[byte])?;
 
         Ok(())
     }
 
     fn flush(&mut self, descriptor: FileDescriptor) -> Result<(), Self::Error> {
         let file = self.file_mut(descriptor)?;
-        file.flush()?;
+        if let OpenFile::Output(writer) = file {
+            writer.flush()?;
+        }
 
         Ok(())
     }
@@ -100,6 +139,7 @@ impl FileSystem for OsFileSystem {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::vec::Vec;
     use std::fs;
 
     #[test]
@@ -130,6 +170,27 @@ mod tests {
     }
 
     #[test]
+    fn buffered_read() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("foo");
+        let expected: Vec<_> = (0..(2 * BUFFER_SIZE + 17))
+            .map(|index| index as u8)
+            .collect();
+        fs::write(&path, &expected).unwrap();
+
+        let mut file_system = OsFileSystem::new();
+        let descriptor = file_system.open(&path, false).unwrap();
+        let mut actual = Vec::new();
+
+        while let Some(byte) = file_system.read(descriptor).unwrap() {
+            actual.push(byte);
+        }
+
+        assert_eq!(actual, expected);
+        file_system.close(descriptor).unwrap();
+    }
+
+    #[test]
     fn write() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("foo");
@@ -148,6 +209,26 @@ mod tests {
     }
 
     #[test]
+    fn buffered_write_is_persisted_by_close() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("foo");
+        let expected: Vec<_> = (0..(2 * BUFFER_SIZE + 17))
+            .map(|index| index as u8)
+            .collect();
+
+        let mut file_system = OsFileSystem::new();
+        let descriptor = file_system.open(&path, true).unwrap();
+
+        for byte in &expected {
+            file_system.write(descriptor, *byte).unwrap();
+        }
+
+        file_system.close(descriptor).unwrap();
+
+        assert_eq!(fs::read(&path).unwrap(), expected);
+    }
+
+    #[test]
     fn flush() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("foo");
@@ -156,8 +237,42 @@ mod tests {
 
         let descriptor = file_system.open(&path, true).unwrap();
 
+        file_system.write(descriptor, 42).unwrap();
+        assert!(fs::read(&path).unwrap().is_empty());
+
         file_system.flush(descriptor).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), [42]);
+
         file_system.close(descriptor).unwrap();
+    }
+
+    #[test]
+    fn wrong_direction_operations_fail() {
+        let directory = tempfile::tempdir().unwrap();
+        let input_path = directory.path().join("input");
+        let output_path = directory.path().join("output");
+        fs::write(&input_path, [42]).unwrap();
+
+        let mut file_system = OsFileSystem::new();
+        let input = file_system.open(&input_path, false).unwrap();
+        let output = file_system.open(&output_path, true).unwrap();
+
+        assert!(file_system.write(input, 42).is_err());
+        assert!(file_system.read(output).is_err());
+
+        file_system.close(input).unwrap();
+        file_system.close(output).unwrap();
+    }
+
+    #[test]
+    fn invalid_descriptor_operations_fail() {
+        let mut file_system = OsFileSystem::new();
+        let descriptor = FileDescriptor::MAX;
+
+        assert!(file_system.read(descriptor).is_err());
+        assert!(file_system.write(descriptor, 42).is_err());
+        assert!(file_system.flush(descriptor).is_err());
+        assert!(file_system.close(descriptor).is_ok());
     }
 
     #[test]
