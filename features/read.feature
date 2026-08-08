@@ -306,6 +306,25 @@ Feature: Read
       | 0 0      | 1 2     | 0     | 3   | 1 2     |
       | 0 0 0 0  | 1 2 3 4 | 1     | 5   | 0 1 2 3 |
 
+  Scenario: Read into a multi-level bytevector in place
+    Given a file named "main.scm" with:
+      """scheme
+      (import (scheme base))
+
+      (define xs (make-bytevector 65 0))
+
+      (read-bytevector! xs (open-input-bytevector #u8(1 2)) 63 65)
+
+      (write-u8
+        (if (and (= (bytevector-u8-ref xs 0) 0)
+                 (= (bytevector-u8-ref xs 63) 1)
+                 (= (bytevector-u8-ref xs 64) 2))
+            65
+            66))
+      """
+    When I successfully run `stak main.scm`
+    Then the stdout should contain exactly "A"
+
   @long
   Scenario Outline: Read a value
     Given a file named "main.scm" with:

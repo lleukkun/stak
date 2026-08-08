@@ -2314,14 +2314,13 @@
           #f
           (car (cddr rest))))
 
-      (do ((start start (+ start 1))
-           (xs (list-tail (bytevector->list xs) start) (cdr xs))
+      (do ((index start (+ index 1))
            (x (peek-u8 port) (peek-u8 port)))
         ((or
-            (null? xs)
+            (>= index (bytevector-length xs))
             (eof-object? x)
-            (and end (>= start end))))
-        (set-car! xs (read-u8 port))))
+            (and end (>= index end))))
+        (bytevector-u8-set! xs index (read-u8 port))))
 
     ; Write
 
