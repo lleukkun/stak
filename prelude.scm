@@ -2200,6 +2200,12 @@
       (apply peek-u8 rest)
       #t)
 
+    (define (utf8-continuation-count byte)
+      (cond
+        ((= (quotient byte 32) 6) 1)
+        ((= (quotient byte 16) 14) 2)
+        (else 3)))
+
     (define (read-char-bytes port)
       (let ((byte (read-u8 port)))
         (cond
@@ -2208,14 +2214,7 @@
           ((zero? (quotient byte 128))
             (list byte))
           (else
-            (let* ((count
-                     (cond
-                       ((= (quotient byte 32) 6)
-                         1)
-                       ((= (quotient byte 16) 14)
-                         2)
-                       (else
-                         3)))
+            (let* ((count (utf8-continuation-count byte))
                    (bytes
                      (let loop ((count count))
                        (if (zero? count)
@@ -2333,27 +2332,29 @@
           (error "cannot write to port"))
         (write byte)))
 
-    (define (write-trailing-bytes integer offset port)
-      (let ((upper (quotient integer 64)))
-        (unless (= offset 64)
-          (write-trailing-bytes upper (/ offset 64) port))
-        (write-u8 (+ 128 (remainder integer 64)) port)))
+    (define (for-each-utf8-byte x f)
+      (let ((integer (char->integer x)))
+        (cond
+          ((< integer 128)
+            (f integer))
+          ((< integer 2048)
+            (f (+ 192 (quotient integer 64)))
+            (f (+ 128 (remainder integer 64))))
+          ((< integer 65536)
+            (f (+ 224 (quotient integer 4096)))
+            (f (+ 128 (remainder (quotient integer 64) 64)))
+            (f (+ 128 (remainder integer 64))))
+          (else
+            (f (+ 240 (quotient integer 262144)))
+            (f (+ 128 (remainder (quotient integer 4096) 64)))
+            (f (+ 128 (remainder (quotient integer 64) 64)))
+            (f (+ 128 (remainder integer 64)))))))
 
     (define (write-char x . rest)
-      (let ((port (get-output-port rest))
-            (integer (char->integer x)))
-        (if (zero? (quotient integer 128))
-          (write-u8 integer port)
-          (let loop ((head 32) (offset 64) (mask 192))
-            (if (zero? (quotient integer (* head offset)))
-              (begin
-                ; TODO Use `floor/`?
-                (write-u8 (+ mask (quotient integer offset)) port)
-                (write-trailing-bytes
-                  (remainder integer offset)
-                  offset
-                  port))
-              (loop (/ head 2) (* offset 64) (+ mask head)))))))
+      (let ((port (get-output-port rest)))
+        (for-each-utf8-byte
+          x
+          (lambda (byte) (write-u8 byte port)))))
 
     (define (write-string x . rest)
       (let ((port (get-output-port rest)))
@@ -2386,25 +2387,11 @@
     ; In-memory ports
 
     (define (char->utf8-bytes x)
-      (let ((integer (char->integer x)))
-        (cond
-          ((< integer 128)
-            (list integer))
-          ((< integer 2048)
-            (list
-              (+ 192 (quotient integer 64))
-              (+ 128 (remainder integer 64))))
-          ((< integer 65536)
-            (list
-              (+ 224 (quotient integer 4096))
-              (+ 128 (remainder (quotient integer 64) 64))
-              (+ 128 (remainder integer 64))))
-          (else
-            (list
-              (+ 240 (quotient integer 262144))
-              (+ 128 (remainder (quotient integer 4096) 64))
-              (+ 128 (remainder (quotient integer 64) 64))
-              (+ 128 (remainder integer 64)))))))
+      (let ((bytes '()))
+        (for-each-utf8-byte
+          x
+          (lambda (byte) (set! bytes (cons byte bytes))))
+        (reverse bytes)))
 
     (define (open-input-string xs)
       (let ((xs (string->code-points xs))
@@ -2422,12 +2409,6 @@
                 (set! ys (cdr ys))
                 y)))
           (lambda () #f))))
-
-    (define (output-string-continuation-count byte)
-      (cond
-        ((= (quotient byte 32) 6) 1)
-        ((= (quotient byte 16) 14) 2)
-        (else 3)))
 
     (define (append-output-string-char result tail char)
       (set-car! result (+ 1 (string-length result)))
@@ -2451,7 +2432,7 @@
                 (begin
                   (set! pending (list byte))
                   (set! remaining
-                    (output-string-continuation-count byte))))
+                    (utf8-continuation-count byte))))
               (begin
                 (set! pending (cons byte pending))
                 (set! remaining (- remaining 1))

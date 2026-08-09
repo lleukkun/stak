@@ -430,6 +430,31 @@ Feature: String
       | ABC      |
       | Aあ😄      |
 
+  Scenario Outline: Encode string output consistently with string->utf8
+    Given a file named "main.scm" with:
+      """scheme
+      (import (scheme base))
+
+      (define source "<string>")
+      (define expected (string->utf8 source))
+      (define port (open-output-bytevector))
+      (write-string source port)
+      (define actual (get-output-bytevector port))
+
+      (write-u8 (if (equal? actual expected) 65 66))
+      """
+    When I successfully run `stak main.scm`
+    Then the stdout should contain exactly "A"
+
+    Examples:
+      | string   |
+      |          |
+      | A        |
+      | é        |
+      | あ       |
+      | —        |
+      | 😄       |
+
   Scenario Outline: Convert a string case
     Given a file named "main.scm" with:
       """scheme

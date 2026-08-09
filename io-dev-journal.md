@@ -235,7 +235,7 @@ Preparation measurements were statistically unchanged as well. The changes remai
 - `open-output-string` now owns a mutable result string and tail pointer. ASCII bytes are appended immediately; multibyte sequences are retained as pending bytes and decoded when complete using the existing `parse-char-bytes` behavior.
 - `get-output-string` invokes the port’s data thunk and returns the cached result directly. Repeated retrieval is therefore O(1) with respect to prior output and does not rescan or re-finalize the accumulated bytes.
 - Continued writes after retrieval remain supported. Invalid or incomplete output bytes retain the previous decoding behavior as far as the existing parser permits.
-- Codex P2, the inconsistent UTF-8 encoder behavior, remains deliberately excluded because the upcoming `origin/main` rebase already contains its fix; `write-char` was not changed.
+- Codex P2 was deferred until the `origin/main` rebase, which supplied the upstream encoder fix. The post-rebase follow-up consolidates the remaining encoder logic while leaving strict decoder validation for a separate change.
 
 ### String-port validation
 
@@ -277,3 +277,26 @@ Compared with the previously recorded optimized-source mean point estimates, inp
 | UTF-8 output-string | 1.297 s | 294.40 ms | -77.3% |
 
 The run completed successfully with `TMPDIR=target/bench-tmp`. The 27-scenario port validation and the scaling check establish that repeated retrieval no longer causes quadratic rescanning while preserving current encoder behavior. All changes remain uncommitted, and unrelated untracked files remain untouched.
+
+## 2026-08-09 - UTF-8 encoder and decoder helper consolidation
+
+- Audited the UTF-8 paths after the rebase. `write-char` and `char->utf8-bytes` were the two Scheme encoders; `string->utf8` delegates through `open-input-string`, while `write-string` delegates through `write-char`.
+- Added shared `for-each-utf8-byte` logic so both encoders select the same UTF-8 width and emit the same byte sequence. Removed the duplicated recursive `write-trailing-bytes` encoder.
+- The decoder already shared `parse-char-bytes` across `read-char`, `peek-char`, and incremental `open-output-string` decoding. Extracted the duplicated lead-byte continuation-count calculation into `utf8-continuation-count`, used by both input framing and incremental output decoding.
+- Added a string-port regression comparing `write-string` output with `string->utf8` for empty, ASCII, 2-byte, 3-byte, and 4-byte examples, including `é`, `あ`, `—`, and `😄`.
+- Focused differential checks also compared input and incremental-output decoding for valid, truncated, invalid-continuation, and overlong byte sequences; the paths agree under the existing behavior.
+
+### Consolidation validation
+
+- `./tools/integration_test.sh -f std -i stak features/types/port.feature`: **28 scenarios and 87 steps passed**.
+- `./tools/integration_test.sh -f std -i stak features/types/string.feature`: **163 scenarios and 489 steps passed**.
+- `./tools/integration_test.sh -f std -i stak features/read.feature`: **93 scenarios and 479 steps passed**.
+- UTF-8 encoder boundary comparison passed for code points `0`, `127`, `128`, `2047`, `2048`, `65535`, `65536`, and `1114111`.
+- `cargo build --profile release_test --features std`, `cargo fmt --all -- --check`, and `git diff --check` passed.
+- `cargo test -p stak-r7rs --locked --lib`: 3 tests passed.
+
+### Strict decoder follow-up
+
+Strict UTF-8 validation remains a separate medium-sized change. The current decoder still does not reject invalid continuation bytes, overlong encodings, surrogate values, or code points above `U+10FFFF`. Implementing that safely requires choosing compatible behavior for malformed and incomplete sequences across `read-char`, `peek-char`, `read-string`, `utf8->string`, and incremental `open-output-string` decoding. No strict-validation behavior was changed in this consolidation.
+
+The encoder and continuation-count changes are ready for review in the current work-in-progress commit. Unrelated untracked files remain untouched.
