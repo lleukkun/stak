@@ -228,3 +228,52 @@ The clean rerun showed no material regression for in-memory bytevector ports:
 | In-memory bytevector write | -0.44% | -0.79% |
 
 Preparation measurements were statistically unchanged as well. The changes remain uncommitted and the unrelated untracked files remain preserved.
+
+## 2026-08-09 - Incremental in-memory string-port retrieval
+
+- `open-input-string` retains the source code-point tail and encodes one character directly to a short UTF-8 byte list, eliminating the temporary output-bytevector port previously created for every character.
+- `open-output-string` now owns a mutable result string and tail pointer. ASCII bytes are appended immediately; multibyte sequences are retained as pending bytes and decoded when complete using the existing `parse-char-bytes` behavior.
+- `get-output-string` invokes the port’s data thunk and returns the cached result directly. Repeated retrieval is therefore O(1) with respect to prior output and does not rescan or re-finalize the accumulated bytes.
+- Continued writes after retrieval remain supported. Invalid or incomplete output bytes retain the previous decoding behavior as far as the existing parser permits.
+- Codex P2, the inconsistent UTF-8 encoder behavior, remains deliberately excluded because the upcoming `origin/main` rebase already contains its fix; `write-char` was not changed.
+
+### String-port validation
+
+- The port scenarios cover 65-byte output, repeated retrieval, continued writing, and the final partial byte.
+- The long UTF-8 input scenario covers ASCII at index 0, `あ` at index 63, and `😄` at index 64; it verifies all UTF-8 bytes and EOF.
+- The interleaved retrieval regression writes one byte and retrieves the result after each write for 1,000 iterations, then verifies the final length and boundary characters.
+- `./tools/integration_test.sh -f std -i stak features/types/port.feature`: **27 scenarios and 84 steps passed**.
+- `./tools/integration_test.sh -f std -i stak features/types/string.feature`: **157 scenarios and 471 steps passed**.
+- `./tools/integration_test.sh -f std -i stak features/read.feature`: **93 scenarios and 479 steps passed**.
+- `cargo build --profile release_test --features std`, `cargo fmt --all -- --check`, and `git diff --check` passed.
+- Codex’s scaling check verified correct 100,000-character output and reported interleaved write/retrieve CPU times of 0.01 s at 1,000 iterations, 0.02 s at 2,000, 0.04 s at 10,000, and 0.17 s at 100,000.
+
+### String-port benchmark
+
+The relevant fast-profile benchmark was rerun with:
+
+```sh
+TMPDIR=target/bench-tmp GOTMPDIR=target/bench-tmp \
+cargo bench -p stak-bench --bench io --locked -- \
+  --sample-size 10 --warm-up-time 0.2 --measurement-time 0.5
+```
+
+Criterion’s current 100k mean point estimates are:
+
+| Case | Current mean point estimate |
+| --- | ---: |
+| ASCII input-string | 165.59 ms |
+| ASCII output-string | 167.53 ms |
+| UTF-8 input-string | 285.79 ms |
+| UTF-8 output-string | 294.40 ms |
+
+Compared with the previously recorded optimized-source mean point estimates, input remained effectively flat while incremental output retrieval reduced the 100k output cases substantially:
+
+| Case | Previous mean point estimate | Current mean point estimate | Change |
+| --- | ---: | ---: | ---: |
+| ASCII input-string | 164.29 ms | 165.59 ms | +0.8% |
+| ASCII output-string | 605.80 ms | 167.53 ms | -72.3% |
+| UTF-8 input-string | 283.65 ms | 285.79 ms | +0.8% |
+| UTF-8 output-string | 1.297 s | 294.40 ms | -77.3% |
+
+The run completed successfully with `TMPDIR=target/bench-tmp`. The 27-scenario port validation and the scaling check establish that repeated retrieval no longer causes quadratic rescanning while preserving current encoder behavior. All changes remain uncommitted, and unrelated untracked files remain untouched.
