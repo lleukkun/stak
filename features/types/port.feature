@@ -215,6 +215,36 @@ Feature: Port
       | 65 66    | AB     | 2      |
       | 65 66 67 | ABC    | 3      |
 
+  Scenario: Read a long bytevector port across native tree boundaries
+    Given a file named "main.scm" with:
+      """scheme
+      (import (scheme base))
+
+      (define source (make-bytevector 4097 0))
+      (bytevector-u8-set! source 0 11)
+      (bytevector-u8-set! source 63 22)
+      (bytevector-u8-set! source 64 33)
+      (bytevector-u8-set! source 4095 44)
+      (bytevector-u8-set! source 4096 55)
+      (define port (open-input-bytevector source))
+      (define destination (make-bytevector 4097 255))
+      (define count (read-bytevector! destination port))
+      (define end (read-bytevector! destination port))
+
+      (write-u8
+        (if (and (= count 4097)
+                 (eof-object? end)
+                 (= (bytevector-u8-ref destination 0) 11)
+                 (= (bytevector-u8-ref destination 63) 22)
+                 (= (bytevector-u8-ref destination 64) 33)
+                 (= (bytevector-u8-ref destination 4095) 44)
+                 (= (bytevector-u8-ref destination 4096) 55))
+          65
+          66))
+      """
+    When I successfully run `stak main.scm`
+    Then the stdout should contain exactly "A"
+
   Scenario: Preserve chunked bytevector output across retrievals
     Given a file named "main.scm" with:
       """scheme
@@ -247,6 +277,34 @@ Feature: Port
                  (= (bytevector-u8-ref third 65) 65))
             65
             66))
+      """
+    When I successfully run `stak main.scm`
+    Then the stdout should contain exactly "A"
+
+  Scenario: Write a long bytevector port across native chunk boundaries
+    Given a file named "main.scm" with:
+      """scheme
+      (import (scheme base))
+
+      (define source (make-bytevector 4097 0))
+      (bytevector-u8-set! source 0 11)
+      (bytevector-u8-set! source 63 22)
+      (bytevector-u8-set! source 64 33)
+      (bytevector-u8-set! source 4095 44)
+      (bytevector-u8-set! source 4096 55)
+      (define port (open-output-bytevector))
+      (write-bytevector source port)
+      (define result (get-output-bytevector port))
+
+      (write-u8
+        (if (and (= (bytevector-length result) 4097)
+                 (= (bytevector-u8-ref result 0) 11)
+                 (= (bytevector-u8-ref result 63) 22)
+                 (= (bytevector-u8-ref result 64) 33)
+                 (= (bytevector-u8-ref result 4095) 44)
+                 (= (bytevector-u8-ref result 4096) 55))
+          65
+          66))
       """
     When I successfully run `stak main.scm`
     Then the stdout should contain exactly "A"

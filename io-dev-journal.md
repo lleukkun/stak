@@ -457,3 +457,38 @@ The large OS read improvement confirms that `read-bytevector` now reaches the na
 - Locked I/O benchmark: completed successfully with the repository-local temporary-directory setup.
 
 All changes remain uncommitted.
+
+## 2026-08-09 - Native in-memory bytevector ports
+
+- Added primitive `601` for native bytevector range copying over the existing 64-way vector tree.
+- Replaced the in-memory bytevector port bulk callbacks' per-byte Scheme loops with native range copies while retaining the scalar callbacks, 64-byte output chunks, repeated retrieval behavior, and callback-port dispatch.
+- The native primitive validates bytevector representations, source and destination ranges, empty ranges, and matches R7RS temporary-storage semantics for overlapping ranges by copying backward when the destination overlaps to the right.
+- Added Rust tests for empty ranges, invalid ranges, both overlap directions, and markers across indices `0`, `63`, `64`, `4095`, and `4096`; the fixtures keep bytevectors rooted and pass under `gc_always`.
+- Corrected the existing nonnumeric-fill fixture so the complete R7RS unit suite also passes under `gc_always`.
+- Added bytevector and port feature regressions for overlap semantics and 4097-byte in-memory reads and writes across chunk/tree boundaries.
+
+### Final benchmark
+
+Locked command:
+
+```text
+TMPDIR=$PWD/target/bench-tmp GOTMPDIR=$PWD/target/bench-tmp cargo bench -p stak-bench --bench io --locked -- --sample-size 10 --warm-up-time 0.2 --measurement-time 0.5
+```
+
+For a 100,000-byte payload, the final quiet-run medians were:
+
+- In-memory bytevector read: **5.0681 MiB/s**.
+- In-memory bytevector write: **3.5327 MiB/s**.
+- OS bytevector read: **10.094 MiB/s**.
+- OS bytevector write: **9.8041 MiB/s**.
+
+The quiet rerun completed successfully after the earlier CPU-loaded run. Relative to the original approximately **443.90 KiB/s** read and **287.32 KiB/s** write, the in-memory paths now measure roughly **11.7x** and **12.6x** faster, respectively.
+
+### Focused validation
+
+- R7RS primitive tests: **7 passed** in both normal and `gc_always` configurations.
+- Bytevector and port feature suites: **129 scenarios / 423 steps passed**.
+- Formatting and `git diff --check`: passed.
+- The full workspace test invocation was not completed because it exceeded the available interactive run time; the focused suites and release integration build passed.
+
+All changes remain uncommitted for review.

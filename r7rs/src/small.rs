@@ -12,7 +12,7 @@ use stak_native::{
 };
 use stak_process_context::{ProcessContext, ProcessContextPrimitiveSet};
 use stak_time::{Clock, TimePrimitiveSet};
-use stak_vm::{Heap, Memory, Number, PrimitiveSet, Tag, Type, Value};
+use stak_vm::{Cons, Heap, Memory, Number, PrimitiveSet, Tag, Type, Value};
 use winter_maybe_async::{maybe_async, maybe_await};
 
 const BYTEVECTOR_TAG: Tag = 8;
@@ -144,6 +144,144 @@ impl<D: Device, F: FileSystem, P: ProcessContext, C: Clock> SmallPrimitiveSet<D,
         let number = Self::nonnegative_integer(number)?;
         Ok(u8::try_from(number).map_err(|_| stak_vm::Error::NumberExpected)?)
     }
+
+    fn bytevector_copy<H: Heap>(memory: &mut Memory<H>) -> Result<(), Error> {
+        let [
+            destination,
+            destination_offset,
+            source,
+            source_start,
+            source_end,
+        ] = memory.pop_many()?;
+        let destination_offset = Self::nonnegative_integer(Number::try_from(destination_offset)?)?;
+        let source_start = Self::nonnegative_integer(Number::try_from(source_start)?)?;
+        let source_end = Self::nonnegative_integer(Number::try_from(source_end)?)?;
+        let (destination_root, destination_length) = bytevector_info(memory, destination)?;
+        let (source_root, source_length) = bytevector_info(memory, source)?;
+
+        if source_start > source_end
+            || source_end > source_length
+            || destination_offset > destination_length
+            || source_end - source_start > destination_length - destination_offset
+        {
+            return Err(stak_vm::Error::InvalidMemoryAccess.into());
+        }
+
+        let count = source_end - source_start;
+        let overlaps_to_the_right = destination_root == source_root
+            && destination_offset > source_start
+            && destination_offset < source_end;
+
+        if overlaps_to_the_right {
+            for offset in (0..count).rev() {
+                let byte =
+                    bytevector_get(memory, source_root, source_length, source_start + offset)?;
+                bytevector_set(
+                    memory,
+                    destination_root,
+                    destination_length,
+                    destination_offset + offset,
+                    byte,
+                )?;
+            }
+        } else {
+            for offset in 0..count {
+                let byte =
+                    bytevector_get(memory, source_root, source_length, source_start + offset)?;
+                bytevector_set(
+                    memory,
+                    destination_root,
+                    destination_length,
+                    destination_offset + offset,
+                    byte,
+                )?;
+            }
+        }
+
+        memory.push(memory.boolean(false)?.into())?;
+        Ok(())
+    }
+}
+
+fn bytevector_info<H: Heap>(memory: &Memory<H>, value: Value) -> Result<(Value, usize), Error> {
+    let bytevector = value.to_cons().ok_or(stak_vm::Error::ConsExpected)?;
+    let root = memory.cdr(bytevector)?;
+    if root.tag() != BYTEVECTOR_TAG {
+        return Err(stak_vm::Error::ConsExpected.into());
+    }
+
+    let length = bytevector_length(memory, bytevector)?;
+    Ok((root, length))
+}
+
+fn bytevector_length<H: Heap>(memory: &Memory<H>, bytevector: Cons) -> Result<usize, Error> {
+    let number = Number::try_from(memory.car(bytevector)?)?;
+    let float = number.to_f64();
+    let integer = number.to_i64();
+    if integer < 0 || float != integer as f64 {
+        return Err(stak_vm::Error::NumberExpected.into());
+    }
+
+    usize::try_from(integer as u64).map_err(|_| stak_vm::Error::NumberExpected.into())
+}
+
+fn vector_cell<H: Heap>(
+    memory: &Memory<H>,
+    root: Value,
+    length: usize,
+    index: usize,
+) -> Result<Cons, Error> {
+    if index >= length {
+        return Err(stak_vm::Error::InvalidMemoryAccess.into());
+    }
+
+    let mut p = 1usize;
+    for _ in 0..vector_height(length) {
+        p = p
+            .checked_mul(VECTOR_FACTOR)
+            .ok_or(stak_vm::Error::InvalidMemoryAccess)?;
+    }
+
+    let mut list = root.to_cons().ok_or(stak_vm::Error::ConsExpected)?;
+    let mut index = index;
+    let mut first = true;
+    while p > 0 {
+        if !first {
+            list = memory
+                .car(list)?
+                .to_cons()
+                .ok_or(stak_vm::Error::ConsExpected)?;
+        }
+        list = memory.tail(list, index / p)?;
+        index %= p;
+        p /= VECTOR_FACTOR;
+        first = false;
+    }
+
+    Ok(list)
+}
+
+fn bytevector_get<H: Heap>(
+    memory: &Memory<H>,
+    root: Value,
+    length: usize,
+    index: usize,
+) -> Result<u8, Error> {
+    let cell = vector_cell(memory, root, length, index)?;
+    let value = Number::try_from(memory.car(cell)?)?.to_i64();
+    u8::try_from(value).map_err(|_| stak_vm::Error::NumberExpected.into())
+}
+
+fn bytevector_set<H: Heap>(
+    memory: &mut Memory<H>,
+    root: Value,
+    length: usize,
+    index: usize,
+    byte: u8,
+) -> Result<(), Error> {
+    let cell = vector_cell(memory, root, length, index)?;
+    memory.set_car(cell, Number::from_i64(i64::from(byte)).into())?;
+    Ok(())
 }
 
 fn vector_height(mut length: usize) -> usize {
@@ -249,6 +387,7 @@ impl<H: Heap, D: Device, F: FileSystem, P: ProcessContext, C: Clock> PrimitiveSe
             Primitive::EXPT => memory.operate_binary(Number::power)?,
             Primitive::HALT => return Err(Error::Halt),
             Primitive::MAKE_BYTEVECTOR => Self::make_bytevector(memory)?,
+            Primitive::BYTEVECTOR_COPY => Self::bytevector_copy(memory)?,
             Primitive::NULL | Primitive::PAIR => {
                 maybe_await!(self.type_check.operate(memory, primitive - Primitive::NULL))?
             }
@@ -330,6 +469,148 @@ mod tests {
         )
     }
 
+    fn make_bytevector(memory: &mut Memory<[Value; 50000]>, length: usize, fill: u8) -> Value {
+        memory.push(Number::from_i64(length as _).into()).unwrap();
+        memory
+            .push(Number::from_i64(i64::from(fill)).into())
+            .unwrap();
+        block_on!(primitive_set().operate(memory, Primitive::MAKE_BYTEVECTOR)).unwrap();
+        memory.pop().unwrap()
+    }
+
+    fn stack_value(memory: &Memory<[Value; 50000]>, index: usize) -> Value {
+        let cell = memory.tail(memory.stack(), index).unwrap();
+        memory.car(cell).unwrap()
+    }
+
+    fn copy_bytevector(
+        memory: &mut Memory<[Value; 50000]>,
+        destination_index: usize,
+        destination_offset: usize,
+        source_index: usize,
+        source_start: usize,
+        source_end: usize,
+    ) -> Result<(), Error> {
+        let destination = stack_value(memory, destination_index);
+        memory.push(destination).unwrap();
+        memory
+            .push(Number::from_i64(destination_offset as _).into())
+            .unwrap();
+        let source = stack_value(memory, source_index + 2);
+        memory.push(source).unwrap();
+        memory
+            .push(Number::from_i64(source_start as _).into())
+            .unwrap();
+        memory
+            .push(Number::from_i64(source_end as _).into())
+            .unwrap();
+
+        block_on!(primitive_set().operate(memory, Primitive::BYTEVECTOR_COPY))?;
+        memory.pop().unwrap();
+        Ok(())
+    }
+
+    #[test]
+    fn bytevector_copy_crosses_vector_boundaries() {
+        let mut memory = Memory::new([Default::default(); 50000]).unwrap();
+        let source = make_bytevector(&mut memory, 4097, 0);
+        memory.push(source).unwrap();
+        let destination = make_bytevector(&mut memory, 4097, 255);
+        memory.push(destination).unwrap();
+        let source = stack_value(&memory, 1);
+
+        let source_root = bytevector_info(&memory, source).unwrap().0;
+        for (index, byte) in [(0, 11), (63, 22), (64, 33), (4095, 44), (4096, 55)] {
+            bytevector_set(&mut memory, source_root, 4097, index, byte).unwrap();
+        }
+
+        copy_bytevector(&mut memory, 0, 0, 1, 0, 4097).unwrap();
+        let destination = stack_value(&memory, 0);
+        let (destination_root, destination_length) = bytevector_info(&memory, destination).unwrap();
+        for (index, expected) in [(0, 11), (63, 22), (64, 33), (4095, 44), (4096, 55)] {
+            assert_eq!(
+                bytevector_get(&memory, destination_root, destination_length, index).unwrap(),
+                expected
+            );
+        }
+        for index in 0..destination_length {
+            if !matches!(index, 0 | 63 | 64 | 4095 | 4096) {
+                assert_eq!(
+                    bytevector_get(&memory, destination_root, destination_length, index).unwrap(),
+                    0
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn bytevector_copy_handles_overlap_in_both_directions() {
+        let mut memory = Memory::new([Default::default(); 50000]).unwrap();
+        let bytevector = make_bytevector(&mut memory, 4, 0);
+        memory.push(bytevector).unwrap();
+        let bytevector = stack_value(&memory, 0);
+        let root = bytevector_info(&memory, bytevector).unwrap().0;
+
+        for (index, byte) in [(0, 0), (1, 1), (2, 2), (3, 3)] {
+            bytevector_set(&mut memory, root, 4, index, byte).unwrap();
+        }
+        copy_bytevector(&mut memory, 0, 1, 0, 0, 3).unwrap();
+        let bytevector = stack_value(&memory, 0);
+        let root = bytevector_info(&memory, bytevector).unwrap().0;
+        assert_eq!(bytevector_get(&memory, root, 4, 0).unwrap(), 0);
+        assert_eq!(bytevector_get(&memory, root, 4, 1).unwrap(), 0);
+        assert_eq!(bytevector_get(&memory, root, 4, 2).unwrap(), 1);
+        assert_eq!(bytevector_get(&memory, root, 4, 3).unwrap(), 2);
+
+        let root = bytevector_info(&memory, bytevector).unwrap().0;
+        for (index, byte) in [(0, 0), (1, 1), (2, 2), (3, 3)] {
+            bytevector_set(&mut memory, root, 4, index, byte).unwrap();
+        }
+        copy_bytevector(&mut memory, 0, 0, 0, 1, 4).unwrap();
+        let bytevector = stack_value(&memory, 0);
+        let root = bytevector_info(&memory, bytevector).unwrap().0;
+        assert_eq!(bytevector_get(&memory, root, 4, 0).unwrap(), 1);
+        assert_eq!(bytevector_get(&memory, root, 4, 1).unwrap(), 2);
+        assert_eq!(bytevector_get(&memory, root, 4, 2).unwrap(), 3);
+        assert_eq!(bytevector_get(&memory, root, 4, 3).unwrap(), 3);
+    }
+
+    #[test]
+    fn bytevector_copy_rejects_invalid_ranges() {
+        for (destination_offset, source_start, source_end) in [(0, 2, 1), (0, 0, 4), (3, 0, 2)] {
+            let mut memory = Memory::new([Default::default(); 50000]).unwrap();
+            let source = make_bytevector(&mut memory, 3, 65);
+            memory.push(source).unwrap();
+            let destination = make_bytevector(&mut memory, 4, 0);
+            memory.push(destination).unwrap();
+
+            assert_eq!(
+                copy_bytevector(
+                    &mut memory,
+                    0,
+                    destination_offset,
+                    1,
+                    source_start,
+                    source_end,
+                ),
+                Err(Error::Vm(stak_vm::Error::InvalidMemoryAccess))
+            );
+        }
+    }
+
+    #[test]
+    fn bytevector_copy_accepts_empty_ranges_and_empty_bytevectors() {
+        let mut memory = Memory::new([Default::default(); 50000]).unwrap();
+        let source = make_bytevector(&mut memory, 0, 0);
+        memory.push(source).unwrap();
+        let destination = make_bytevector(&mut memory, 0, 0);
+        memory.push(destination).unwrap();
+
+        copy_bytevector(&mut memory, 0, 0, 1, 0, 0).unwrap();
+        let destination = stack_value(&memory, 0);
+        assert_eq!(bytevector_info(&memory, destination).unwrap().1, 0);
+    }
+
     #[test]
     fn make_bytevector_relocates_the_filled_root() {
         let mut memory = Memory::new([Default::default(); 24]).unwrap();
@@ -367,8 +648,9 @@ mod tests {
     fn make_bytevector_rejects_nonnumeric_fill() {
         let mut memory = Memory::new([Default::default(); 64]).unwrap();
         let false_value = memory.boolean(false).unwrap();
-        memory.push(Number::from_i64(1).into()).unwrap();
         memory.push(false_value.into()).unwrap();
+        memory.push(Number::from_i64(1).into()).unwrap();
+        memory.push(memory.boolean(false).unwrap().into()).unwrap();
 
         assert_eq!(
             block_on!(primitive_set().operate(&mut memory, Primitive::MAKE_BYTEVECTOR)),

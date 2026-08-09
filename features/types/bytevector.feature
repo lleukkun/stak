@@ -143,6 +143,36 @@ Feature: Bytevector
       | 0 1 2 3   | 1 #u8(4 5 6 7) 1   | AFGH   |
       | 0 1 2 3   | 1 #u8(4 5 6 7) 1 3 | AFGD   |
 
+  Scenario: Preserve temporary-storage overlap semantics when copying a bytevector
+    Given a file named "main.scm" with:
+      """scheme
+      (import (scheme base))
+
+      (define xs (bytevector 0 1 2 3))
+      (bytevector-copy! xs 1 xs 0 3)
+      (write-u8 (+ 65 (bytevector-u8-ref xs 0)))
+      (write-u8 (+ 65 (bytevector-u8-ref xs 1)))
+      (write-u8 (+ 65 (bytevector-u8-ref xs 2)))
+      (write-u8 (+ 65 (bytevector-u8-ref xs 3)))
+      """
+    When I successfully run `stak main.scm`
+    Then the stdout should contain exactly "AABC"
+
+  Scenario: Preserve left overlap semantics when copying a bytevector
+    Given a file named "main.scm" with:
+      """scheme
+      (import (scheme base))
+
+      (define xs (bytevector 0 1 2 3))
+      (bytevector-copy! xs 0 xs 1 4)
+      (write-u8 (+ 65 (bytevector-u8-ref xs 0)))
+      (write-u8 (+ 65 (bytevector-u8-ref xs 1)))
+      (write-u8 (+ 65 (bytevector-u8-ref xs 2)))
+      (write-u8 (+ 65 (bytevector-u8-ref xs 3)))
+      """
+    When I successfully run `stak main.scm`
+    Then the stdout should contain exactly "BCDD"
+
   Scenario: Make an empty bytevector
     Given a file named "main.scm" with:
       """scheme
