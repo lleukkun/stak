@@ -480,3 +480,385 @@ Feature: Port
       """
     When I successfully run `stak main.scm`
     Then the stdout should contain exactly "A"
+
+  @stak
+  Scenario: Read a bytevector through a native bulk input port with a destination range
+    Given a file named "main.scm" with:
+      """scheme
+      (import (scheme base))
+
+      (define destination (make-bytevector 6 255))
+      (define port (open-input-bytevector #u8(10 20 30 40)))
+      (read-bytevector! destination port 2 5)
+
+      (write-u8
+        (if (and (= (bytevector-u8-ref destination 0) 255)
+                 (= (bytevector-u8-ref destination 1) 255)
+                 (= (bytevector-u8-ref destination 2) 10)
+                 (= (bytevector-u8-ref destination 3) 20)
+                 (= (bytevector-u8-ref destination 4) 30)
+                 (= (bytevector-u8-ref destination 5) 255))
+            65
+            66))
+      """
+    When I successfully run `stak main.scm`
+    Then the stdout should contain exactly "A"
+
+  @stak
+  Scenario: Preserve buffered input before a bulk bytevector read
+    Given a file named "main.scm" with:
+      """scheme
+      (import (scheme base))
+
+      (define port (open-input-bytevector #u8(65 66 67)))
+      (define first (peek-u8 port))
+      (define destination (make-bytevector 3))
+      (read-bytevector! destination port)
+
+      (write-u8
+        (if (and (= first 65)
+                 (= (bytevector-u8-ref destination 0) 65)
+                 (= (bytevector-u8-ref destination 1) 66)
+                 (= (bytevector-u8-ref destination 2) 67)
+                 (eof-object? (read-u8 port)))
+            65
+            66))
+      """
+    When I successfully run `stak main.scm`
+    Then the stdout should contain exactly "A"
+
+  @stak
+  Scenario: Write a bytevector through a native bulk output port
+    Given a file named "main.scm" with:
+      """scheme
+      (import (scheme base))
+
+      (define port (open-output-bytevector))
+      (write-bytevector #u8(65 66 67) port)
+      (write-bytevector (get-output-bytevector port))
+      """
+    When I successfully run `stak main.scm`
+    Then the stdout should contain exactly "ABC"
+
+  @stak
+  Scenario: Scalar callback ports remain compatible with bytevector operations
+    Given a file named "main.scm" with:
+      """scheme
+      (import (scheme base) (stak io))
+
+      (define source '(65 66 67))
+      (define reads 0)
+      (define port
+        (make-input-port
+          (lambda ()
+            (set! reads (+ reads 1))
+            (if (pair? source)
+                (let ((byte (car source)))
+                  (set! source (cdr source))
+                  byte)
+                #f))
+          (lambda () #f)))
+      (define destination (make-bytevector 3))
+      (read-bytevector! destination port)
+
+      (write-u8
+        (if (and (= reads 3)
+                 (= (bytevector-u8-ref destination 0) 65)
+                 (= (bytevector-u8-ref destination 1) 66)
+                 (= (bytevector-u8-ref destination 2) 67))
+            65
+            66))
+      """
+    When I successfully run `stak main.scm`
+    Then the stdout should contain exactly "A"
+
+  @stak
+  Scenario: Native bulk bytevector writes honor a destination range
+    Given a file named "main.scm" with:
+      """scheme
+      (import (scheme base))
+
+      (define port (open-output-bytevector))
+      (write-bytevector #u8(65 66 67) port 1 5)
+      (write-bytevector (get-output-bytevector port))
+      """
+    When I successfully run `stak main.scm`
+    Then the stdout should contain exactly "BC"
+
+  @stak
+  Scenario: Scalar bytevector writes honor a destination range
+    Given a file named "main.scm" with:
+      """scheme
+      (import (scheme base) (stak io))
+
+      (define output '())
+      (define port
+        (make-output-port
+          (lambda (byte) (set! output (append output (list byte))))
+          (lambda () #f)
+          (lambda () #f)))
+      (write-bytevector #u8(65 66 67) port 1 2)
+
+      (write-u8 (if (equal? output '(66)) 65 66))
+      """
+    When I successfully run `stak main.scm`
+    Then the stdout should contain exactly "A"
+
+  @stak
+  Scenario: Native bulk bytevector reads return counts and EOF
+    Given a file named "main.scm" with:
+      """scheme
+      (import (scheme base))
+
+      (define port (open-input-bytevector #u8(65 66 67)))
+      (define destination (make-bytevector 3))
+      (define count (read-bytevector! destination port))
+      (define end (read-bytevector! destination port))
+
+      (write-u8
+        (if (and (= count 3) (eof-object? end)) 65 66))
+      """
+    When I successfully run `stak main.scm`
+    Then the stdout should contain exactly "A"
+
+  @stak
+  Scenario: Scalar bytevector reads return counts and EOF
+    Given a file named "main.scm" with:
+      """scheme
+      (import (scheme base) (stak io))
+
+      (define source '(65 66 67))
+      (define port
+        (make-input-port
+          (lambda ()
+            (if (pair? source)
+                (let ((byte (car source)))
+                  (set! source (cdr source))
+                  byte)
+                #f))
+          (lambda () #f)))
+      (define destination (make-bytevector 3))
+      (define count (read-bytevector! destination port))
+      (define end (read-bytevector! destination port))
+
+      (write-u8
+        (if (and (= count 3) (eof-object? end)) 65 66))
+      """
+    When I successfully run `stak main.scm`
+    Then the stdout should contain exactly "A"
+
+  @stak
+  Scenario: Empty scalar bytevector reads do not probe input
+    Given a file named "main.scm" with:
+      """scheme
+      (import (scheme base) (stak io))
+
+      (define calls 0)
+      (define port
+        (make-input-port
+          (lambda ()
+            (set! calls (+ calls 1))
+            #f)
+          (lambda () #f)))
+      (define destination (make-bytevector 1))
+      (define count (read-bytevector! destination port 0 0))
+      (define result (read-bytevector 0 port))
+
+      (write-u8
+        (if (and (= count 0)
+                 (equal? result #u8())
+                 (= calls 0))
+            65
+            66))
+      """
+    When I successfully run `stak main.scm`
+    Then the stdout should contain exactly "A"
+
+  @stak
+  Scenario: Scalar bytevector reads reject invalid ranges
+    Given a file named "main.scm" with:
+      """scheme
+      (import (scheme base) (stak io))
+
+      (define port
+        (make-input-port
+          (lambda () 65)
+          (lambda () #f)))
+      (read-bytevector! (make-bytevector 3) port 2 1)
+      """
+    When I run `stak main.scm`
+    Then the exit status should not be 0
+    And the stderr should contain "invalid bytevector range"
+
+  @stak
+  Scenario: Scalar bytevector writes reject invalid ranges
+    Given a file named "main.scm" with:
+      """scheme
+      (import (scheme base) (stak io))
+
+      (define port
+        (make-output-port
+          (lambda (byte) #f)
+          (lambda () #f)
+          (lambda () #f)))
+      (write-bytevector #u8(65 66 67) port 2 1)
+      """
+    When I run `stak main.scm`
+    Then the exit status should not be 0
+    And the stderr should contain "invalid bytevector range"
+
+  @stak
+  Scenario: Native file bulk reads preserve boundary markers and counts
+    Given a file named "main.scm" with:
+      """scheme
+      (import (scheme base) (scheme file))
+
+      (define output (open-output-file "native-read.bin"))
+      (do ((index 0 (+ index 1)))
+        ((= index 4097))
+        (write-u8
+          (cond
+            ((= index 0) 11)
+            ((= index 63) 22)
+            ((= index 64) 33)
+            ((= index 4095) 44)
+            ((= index 4096) 55)
+            (else 0))
+          output))
+      (close-output-port output)
+
+      (define destination (make-bytevector 4097 0))
+      (define input (open-input-file "native-read.bin"))
+      (define count (read-bytevector! destination input))
+      (define end (read-bytevector! destination input))
+      (close-input-port input)
+
+      (define check (open-input-file "native-read.bin"))
+      (define first (read-u8 check))
+      (do ((index 1 (+ index 1)))
+        ((= index 63))
+        (read-u8 check))
+      (define at-63 (read-u8 check))
+      (define at-64 (read-u8 check))
+      (do ((index 65 (+ index 1)))
+        ((= index 4095))
+        (read-u8 check))
+      (define at-4095 (read-u8 check))
+      (define at-4096 (read-u8 check))
+      (close-input-port check)
+
+      (write-u8
+        (if (and (= count 4097)
+                 (eof-object? end)
+                 (= (bytevector-u8-ref destination 0) 11)
+                 (= (bytevector-u8-ref destination 63) 22)
+                 (= (bytevector-u8-ref destination 64) 33)
+                 (= (bytevector-u8-ref destination 4095) 44)
+                 (= (bytevector-u8-ref destination 4096) 55)
+                 (= first 11)
+                 (= at-63 22)
+                 (= at-64 33)
+                 (= at-4095 44)
+                 (= at-4096 55))
+            65
+            66))
+      """
+    When I successfully run `stak main.scm`
+    Then the stdout should contain exactly "A"
+
+  @stak
+  Scenario: Native file ports use bulk bytevector operations
+    Given a file named "main.scm" with:
+      """scheme
+      (import (scheme base) (scheme file))
+
+      (define input (open-input-file "source.bin"))
+      (define bytes (make-bytevector 3))
+      (read-bytevector! bytes input)
+      (close-input-port input)
+
+      (define output (open-output-file "destination.bin"))
+      (write-bytevector #u8() output)
+      (write-bytevector bytes output)
+      (close-output-port output)
+
+      (define result (make-bytevector 3))
+      (define check (open-input-file "destination.bin"))
+      (read-bytevector! result check)
+      (close-input-port check)
+
+      (write-bytevector result)
+      """
+    And a file named "source.bin" with:
+      """
+      ABC
+      """
+    When I successfully run `stak main.scm`
+    Then the stdout should contain exactly "ABC"
+
+  @stak
+  Scenario: Native file bulk writes preserve bytevector chunk boundaries
+    Given a file named "main.scm" with:
+      """scheme
+      (import (scheme base) (scheme file))
+
+      (define source (make-bytevector 65 65))
+      (bytevector-u8-set! source 0 0)
+      (bytevector-u8-set! source 64 64)
+
+      (define output (open-output-file "boundary.bin"))
+      (write-bytevector source output)
+      (close-output-port output)
+
+      (define input (open-input-file "boundary.bin"))
+      (define first (read-u8 input))
+      (do ((index 1 (+ index 1)))
+        ((= index 63))
+        (read-u8 input))
+      (define penultimate (read-u8 input))
+      (define last (read-u8 input))
+      (close-input-port input)
+
+      (write-u8
+        (if (and (= first 0)
+                 (= penultimate 65)
+                 (= last 64))
+            65
+            66))
+      """
+    When I successfully run `stak main.scm`
+    Then the stdout should contain exactly "A"
+
+  @stak
+  Scenario: Native file bulk writes preserve the 4096/4097 vector-height boundary
+    Given a file named "main.scm" with:
+      """scheme
+      (import (scheme base) (scheme file))
+
+      (define source (make-bytevector 4097 0))
+      (bytevector-u8-set! source 0 11)
+      (bytevector-u8-set! source 4095 22)
+      (bytevector-u8-set! source 4096 33)
+
+      (define output (open-output-file "height-boundary.bin"))
+      (write-bytevector source output)
+      (close-output-port output)
+
+      (define input (open-input-file "height-boundary.bin"))
+      (define first (read-u8 input))
+      (do ((index 1 (+ index 1)))
+        ((= index 4095))
+        (read-u8 input))
+      (define before-height (read-u8 input))
+      (define at-height (read-u8 input))
+      (close-input-port input)
+
+      (write-u8
+        (if (and (= first 11)
+                 (= before-height 22)
+                 (= at-height 33))
+            65
+            66))
+      """
+    When I successfully run `stak main.scm`
+    Then the stdout should contain exactly "A"

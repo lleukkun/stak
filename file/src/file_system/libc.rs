@@ -84,6 +84,29 @@ impl FileSystem for LibcFileSystem {
         Ok(())
     }
 
+    fn read_into(
+        &mut self,
+        descriptor: FileDescriptor,
+        destination: &mut [u8],
+    ) -> Result<usize, Self::Error> {
+        io::read(self.file(descriptor)?, destination).map_err(|_| FileError::Read)
+    }
+
+    fn write_from(&mut self, descriptor: FileDescriptor, source: &[u8]) -> Result<(), Self::Error> {
+        let file = self.file(descriptor)?;
+        let mut offset = 0;
+
+        while offset < source.len() {
+            let count = io::write(file, &source[offset..]).map_err(|_| FileError::Write)?;
+            if count == 0 {
+                return Err(FileError::Write);
+            }
+            offset += count;
+        }
+
+        Ok(())
+    }
+
     fn flush(&mut self, descriptor: FileDescriptor) -> Result<(), Self::Error> {
         fs::fsync(self.file(descriptor)?).map_err(|_| FileError::Flush)?;
 
@@ -147,6 +170,31 @@ mod tests {
 
         assert_eq!(file_system.read(descriptor).unwrap(), Some(42));
         assert_eq!(file_system.read(descriptor).unwrap(), None);
+    }
+
+    #[test]
+    fn read_into_and_write_from() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("foo");
+        let source = [42, 43, 44];
+
+        let mut file_system = LibcFileSystem::new();
+        let descriptor = file_system.open(&decode_c_str(&path), true).unwrap();
+
+        file_system.write_from(descriptor, &[]).unwrap();
+        file_system.write_from(descriptor, &source).unwrap();
+        file_system.close(descriptor).unwrap();
+
+        let descriptor = file_system.open(&decode_c_str(&path), false).unwrap();
+        let mut destination = [0; 4];
+        assert_eq!(file_system.read_into(descriptor, &mut []), Ok(0));
+        assert_eq!(
+            file_system.read_into(descriptor, &mut destination),
+            Ok(source.len())
+        );
+        assert_eq!(&destination[..source.len()], &source);
+        assert_eq!(file_system.read_into(descriptor, &mut destination), Ok(0));
+        file_system.close(descriptor).unwrap();
     }
 
     #[test]

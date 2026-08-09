@@ -2245,21 +2245,40 @@
     ; Port
 
     (define-record-type port
-      (make-port read write flush close data)
+      (make-port-record read write flush close data bulk-read bulk-write)
       port?
       (read port-read port-set-read!)
       (write port-write port-set-write!)
       (flush port-flush port-set-flush!)
       (close port-close port-set-close!)
-      (data port-data port-set-data!))
+      (data port-data port-set-data!)
+      (bulk-read port-bulk-read port-set-bulk-read!)
+      (bulk-write port-bulk-write port-set-bulk-write!))
+
+    (define (make-port read write flush close data . rest)
+      (make-port-record
+        read
+        write
+        flush
+        close
+        data
+        (if (pair? rest) (car rest) #f)
+        (if (and (pair? rest) (pair? (cdr rest))) (cadr rest) #f)))
 
     (define input-port? port-read)
     (define output-port? port-write)
     (define textual-port? port?)
     (define binary-port? port?)
 
-    (define (make-input-port read close)
-      (make-port read #f #f close '()))
+    (define (make-input-port read close . rest)
+      (make-port
+        read
+        #f
+        #f
+        close
+        '()
+        (if (pair? rest) (car rest) #f)
+        (if (and (pair? rest) (pair? (cdr rest))) (cadr rest) #f)))
 
     (define (make-output-port write flush close . rest)
       (make-port
@@ -2267,7 +2286,11 @@
         write
         flush
         close
-        (if (null? rest) #f (car rest))))
+        (if (null? rest) #f (car rest))
+        (if (and (pair? rest) (pair? (cdr rest))) (cadr rest) #f)
+        (if (and (pair? rest) (pair? (cdr rest)) (pair? (cddr rest)))
+          (car (cddr rest))
+          #f)))
 
     (define current-input-port
       (make-parameter
@@ -2304,7 +2327,9 @@
             port-set-write!
             port-set-flush!
             port-set-close!
-            port-set-data!))))
+            port-set-data!
+            port-set-bulk-read!
+            port-set-bulk-write!))))
 
     (define close-input-port close-port)
     (define close-output-port close-port)
@@ -2411,18 +2436,7 @@
                 '()
                 (cons x (loop))))))))
 
-    (define (read-bytevector count . rest)
-      (define port (get-input-port rest))
-
-      (list->bytevector
-        (let loop ((count count))
-          (let ((x (read-u8 port)))
-            (if (or (eof-object? x) (zero? count))
-              '()
-              (cons x (loop (- count 1))))))))
-
-    (define (read-bytevector! xs . rest)
-      (define port (get-input-port rest))
+    (define (bytevector-range xs rest)
       (define start
         (if (or
              (null? rest)
@@ -2430,20 +2444,64 @@
           0
           (cadr rest)))
       (define end
-        (if (or
-             (null? rest)
-             (null? (cdr rest))
-             (null? (cddr rest)))
-          #f
-          (car (cddr rest))))
+        (min
+          (if (or
+               (null? rest)
+               (null? (cdr rest))
+               (null? (cddr rest)))
+            (bytevector-length xs)
+            (car (cddr rest)))
+          (bytevector-length xs)))
 
-      (do ((index start (+ index 1))
-           (x (peek-u8 port) (peek-u8 port)))
-        ((or
-            (>= index (bytevector-length xs))
-            (eof-object? x)
-            (and end (>= index end))))
-        (bytevector-u8-set! xs index (read-u8 port))))
+      (unless (and
+                (<= 0 start)
+                (<= start end))
+        (error "invalid bytevector range"))
+
+      (cons start end))
+
+    (define (read-bytevector-scalar! xs port start end)
+      (let loop ((index start))
+        (if (>= index end)
+          (- index start)
+          (let ((x (read-u8 port)))
+            (if (eof-object? x)
+              (if (= index start) (eof-object) (- index start))
+              (begin
+                (bytevector-u8-set! xs index x)
+                (loop (+ index 1))))))))
+
+    (define (read-bytevector count . rest)
+      (define xs (make-bytevector count))
+      (define count-read (read-bytevector! xs (get-input-port rest)))
+
+      (cond
+        ((eof-object? count-read)
+          count-read)
+        ((= count-read count)
+          xs)
+        (else
+          (bytevector-copy xs 0 count-read))))
+
+    (define (read-bytevector! xs . rest)
+      (define port (get-input-port rest))
+      (define range (bytevector-range xs rest))
+      (define start (car range))
+      (define end (cdr range))
+      (define bulk-read
+        (and
+          (null? (port-data port))
+          (port-bulk-read port)))
+
+      (if bulk-read
+        (let loop ((index start))
+          (if (>= index end)
+            (- index start)
+            (let ((count (bulk-read xs index end)))
+              (if (zero? count)
+                (if (= index start) (eof-object) (- index start))
+                (loop (+ index count))))))
+        (read-bytevector-scalar! xs port start end)))
 
     ; Write
 
@@ -2487,9 +2545,16 @@
           (string->list x))))
 
     (define (write-bytevector xs . rest)
-      (let ((port (get-output-port rest)))
-        (do ((index 0 (+ index 1)))
-          ((= index (bytevector-length xs))
+      (define port (get-output-port rest))
+      (define range (bytevector-range xs rest))
+      (define start (car range))
+      (define end (cdr range))
+      (define bulk-write (port-bulk-write port))
+
+      (if bulk-write
+        (bulk-write xs start end)
+        (do ((index start (+ index 1)))
+          ((>= index end)
             #f)
           (write-u8 (bytevector-u8-ref xs index) port))))
 
@@ -2520,19 +2585,28 @@
     (define (open-input-string xs)
       (let ((xs (string->code-points xs))
             (ys '()))
-        (make-input-port
-          (lambda ()
-            (when (and
-                   (null? ys)
-                   (not (null? xs)))
-              (set! ys (char->utf8-bytes (integer->char (car xs))))
-              (set! xs (cdr xs)))
-            (and
-              (pair? ys)
-              (let ((y (car ys)))
-                (set! ys (cdr ys))
-                y)))
-          (lambda () #f))))
+        (define (read-byte)
+          (when (and
+                 (null? ys)
+                 (not (null? xs)))
+            (set! ys (char->utf8-bytes (integer->char (car xs))))
+            (set! xs (cdr xs)))
+          (and
+            (pair? ys)
+            (let ((y (car ys)))
+              (set! ys (cdr ys))
+              y)))
+        (define (read-bulk destination start end)
+          (let loop ((at start))
+            (if (>= at end)
+              (- at start)
+              (let ((byte (read-byte)))
+                (if byte
+                  (begin
+                    (bytevector-u8-set! destination at byte)
+                    (loop (+ at 1)))
+                  (- at start))))))
+        (make-input-port read-byte (lambda () #f) read-bulk)))
 
     (define (append-output-string-char result tail char)
       (set-car! result (+ 1 (string-length result)))
@@ -2575,11 +2649,17 @@
                 (set! pending '())
                 (set! remaining 0)
                 (consume byte)))))
+        (define (write-bulk xs start end)
+          (do ((at start (+ at 1)))
+            ((>= at end) #f)
+            (consume (bytevector-u8-ref xs at))))
         (make-output-port
           consume
           (lambda () #f)
           (lambda () #f)
-          (lambda () result))))
+          (lambda () result)
+          #f
+          write-bulk)))
 
     (define (get-output-string port)
       (let ((get (port-data port)))
@@ -2588,14 +2668,23 @@
     (define (open-input-bytevector xs)
       (let ((index 0)
             (length (bytevector-length xs)))
-        (make-input-port
-          (lambda ()
-            (if (< index length)
-              (let ((x (bytevector-u8-ref xs index)))
-                (set! index (+ index 1))
-                x)
-              #f))
-          (lambda () #f))))
+        (define (read-byte)
+          (if (< index length)
+            (let ((x (bytevector-u8-ref xs index)))
+              (set! index (+ index 1))
+              x)
+            #f))
+        (define (read-bulk destination start end)
+          (let loop ((at start))
+            (if (>= at end)
+              (- at start)
+              (let ((byte (read-byte)))
+                (if byte
+                  (begin
+                    (bytevector-u8-set! destination at byte)
+                    (loop (+ at 1)))
+                  (- at start))))))
+        (make-input-port read-byte (lambda () #f) read-bulk)))
 
     (define bytevector-output-chunk-size 64)
 
@@ -2604,15 +2693,20 @@
             (chunk (make-bytevector bytevector-output-chunk-size 0))
             (index 0)
             (length 0))
+        (define (write-byte byte)
+          (bytevector-u8-set! chunk index byte)
+          (set! index (+ index 1))
+          (set! length (+ length 1))
+          (when (= index bytevector-output-chunk-size)
+            (set! chunks (cons chunk chunks))
+            (set! chunk (make-bytevector bytevector-output-chunk-size 0))
+            (set! index 0)))
+        (define (write-bulk xs start end)
+          (do ((at start (+ at 1)))
+            ((>= at end) #f)
+            (write-byte (bytevector-u8-ref xs at))))
         (make-output-port
-          (lambda (x)
-            (bytevector-u8-set! chunk index x)
-            (set! index (+ index 1))
-            (set! length (+ length 1))
-            (when (= index bytevector-output-chunk-size)
-              (set! chunks (cons chunk chunks))
-              (set! chunk (make-bytevector bytevector-output-chunk-size 0))
-              (set! index 0)))
+          write-byte
           (lambda () #f)
           (lambda () #f)
           (lambda ()
@@ -2628,7 +2722,9 @@
                   offset
                   (car chunks)
                   0
-                  bytevector-output-chunk-size)))))))
+                  bytevector-output-chunk-size))))
+          #f
+          write-bulk)))
 
     (define (get-output-bytevector port)
       (let ((get (port-data port)))
@@ -6864,6 +6960,8 @@
     (define $delete-file (primitive 204))
     (define $exists-file (primitive 205))
     (define $flush-file (primitive 206))
+    (define $read-file-bulk (primitive 207))
+    (define $write-file-bulk (primitive 208))
 
     (define (call-with-input-file path f)
       (call-with-port (open-input-file path) f))
@@ -6885,7 +6983,15 @@
             (lambda (byte) ($write-file descriptor byte))
             (lambda () ($flush-file descriptor))
             (lambda () ($close-file descriptor))
-            '()))))
+            '()
+            (and
+              (not output)
+              (lambda (xs start end)
+                ($read-file-bulk descriptor xs start end)))
+            (and
+              output
+              (lambda (xs start end)
+                ($write-file-bulk descriptor xs start end)))))))
 
     (define open-input-file (open-file #f))
     (define open-output-file (open-file #t))

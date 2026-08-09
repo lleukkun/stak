@@ -108,6 +108,36 @@ impl FileSystem for OsFileSystem {
         Ok(())
     }
 
+    fn read_into(
+        &mut self,
+        descriptor: FileDescriptor,
+        destination: &mut [u8],
+    ) -> Result<usize, Self::Error> {
+        let file = self.file_mut(descriptor)?;
+        let OpenFile::Input(reader) = file else {
+            return Err(io::Error::new(
+                ErrorKind::InvalidInput,
+                "cannot read from an output file",
+            ));
+        };
+
+        reader.read(destination)
+    }
+
+    fn write_from(&mut self, descriptor: FileDescriptor, source: &[u8]) -> Result<(), Self::Error> {
+        let file = self.file_mut(descriptor)?;
+        let OpenFile::Output(writer) = file else {
+            return Err(io::Error::new(
+                ErrorKind::InvalidInput,
+                "cannot write to an input file",
+            ));
+        };
+
+        writer.write_all(source)?;
+
+        Ok(())
+    }
+
     fn flush(&mut self, descriptor: FileDescriptor) -> Result<(), Self::Error> {
         let file = self.file_mut(descriptor)?;
         if let OpenFile::Output(writer) = file {
@@ -180,10 +210,16 @@ mod tests {
 
         let mut file_system = OsFileSystem::new();
         let descriptor = file_system.open(&path, false).unwrap();
+        assert_eq!(file_system.read_into(descriptor, &mut []).unwrap(), 0);
         let mut actual = Vec::new();
+        let mut buffer = [0; 8192];
 
-        while let Some(byte) = file_system.read(descriptor).unwrap() {
-            actual.push(byte);
+        loop {
+            let count = file_system.read_into(descriptor, &mut buffer).unwrap();
+            if count == 0 {
+                break;
+            }
+            actual.extend_from_slice(&buffer[..count]);
         }
 
         assert_eq!(actual, expected);
@@ -219,9 +255,8 @@ mod tests {
         let mut file_system = OsFileSystem::new();
         let descriptor = file_system.open(&path, true).unwrap();
 
-        for byte in &expected {
-            file_system.write(descriptor, *byte).unwrap();
-        }
+        file_system.write_from(descriptor, &[]).unwrap();
+        file_system.write_from(descriptor, &expected).unwrap();
 
         file_system.close(descriptor).unwrap();
 
@@ -258,7 +293,9 @@ mod tests {
         let output = file_system.open(&output_path, true).unwrap();
 
         assert!(file_system.write(input, 42).is_err());
+        assert!(file_system.write_from(input, &[42]).is_err());
         assert!(file_system.read(output).is_err());
+        assert!(file_system.read_into(output, &mut [0]).is_err());
 
         file_system.close(input).unwrap();
         file_system.close(output).unwrap();
@@ -270,7 +307,9 @@ mod tests {
         let descriptor = FileDescriptor::MAX;
 
         assert!(file_system.read(descriptor).is_err());
+        assert!(file_system.read_into(descriptor, &mut [0]).is_err());
         assert!(file_system.write(descriptor, 42).is_err());
+        assert!(file_system.write_from(descriptor, &[42]).is_err());
         assert!(file_system.flush(descriptor).is_err());
         assert!(file_system.close(descriptor).is_ok());
     }

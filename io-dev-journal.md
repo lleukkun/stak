@@ -359,3 +359,101 @@ The first attempt used relative temporary paths and failed when the filesystem b
 Bytevector throughput also improved from the original run: in-memory read/write moved from 140.59/250.12 KiB/s to 174.13/274.03 KiB/s, while OS read/write moved from 225.51/194.12 KiB/s to 245.05/817.96 KiB/s.
 
 These figures include VM setup and Scheme execution, and the short 10-sample profile is sensitive to normal system variance. The multibyte interleaved retrieval workload remained linear at approximately 0.02s, 0.03s, and 0.06s for 1,000, 2,000, and 5,000 characters. No source or test files were changed by the benchmark run.
+
+## 2026-08-09 - FileSystem bulk-I/O contract (PR 2)
+
+- Confirmed the buffered OS prerequisite is already present on this branch in commit `d7d49900` (`BufReader`/`BufWriter` with 64 KiB buffers); the current work stays at the `FileSystem` boundary and does not change port representation.
+- Added caller-buffered `FileSystem::read_into` and `write_from` methods with scalar defaults, preserving source compatibility for `VoidFileSystem` and other scalar-only implementors. `read_into` permits short reads and reports EOF as `Ok(0)`; `write_from` completes the source or returns an error; empty slices are successful no-ops.
+- Added block implementations for `OsFileSystem`, `LibcFileSystem`, and `MemoryFileSystem`. OS reads/writes use the existing buffered handles; libc writes handle partial progress without allocation; memory reads copy directly and advance the descriptor offset.
+- Added memory, OS, and libc contract coverage for block boundaries, EOF, empty buffers, wrong-direction operations, invalid descriptors, and close persistence.
+
+### PR 2 validation
+
+- `cargo check -p stak-file --no-default-features`: passed.
+- `cargo check -p stak-file --features std`: passed.
+- `cargo check -p stak-file --features libc`: passed.
+- `cargo test -p stak-file --features std --lib file_system::memory::tests::read_into`: passed.
+- OS backend tests with `TMPDIR=$PWD/target/stak-tmp`: **10 passed**.
+- libc backend tests with `TMPDIR=$PWD/target/stak-tmp`: **7 passed**.
+- `cargo test -p stak-file --features libc --lib --no-run`, `cargo fmt --all -- --check`, and `git diff --check`: passed.
+
+The changes remain uncommitted. Existing unrelated untracked files remain untouched.
+
+## 2026-08-09 - Bulk port dispatch bootstrap fixes (PR 3)
+
+- Confirmed that the root `prelude.scm` participates in compiler bootstrapping twice: `compiler/src/prelude.scm` is a symlink to it, the compiler build script compiles that prelude together with `compile.scm` into compiler bytecode, and `compile_r7rs` prepends the same prelude to every R7RS input.
+- Traced the compiler `OutOfMemory` failure to a balanced-but-misplaced pair of parentheses. An extra close at the end of `read-bytevector!` ended `(stak io)` early, while a missing close at `get-output-bytevector` balanced the whole file later. The intervening definitions were consequently compiled in the wrong library context and caused runaway expansion. Corrected the library boundary.
+- Replaced `caddr` in `make-output-port` with `(car (cddr rest))`; `(stak io)` imports `(stak base)`, which does not export `caddr`.
+- Corrected native bytevector validation to inspect the tagged bytevector root in the outer rib's cdr. Checking the outer rib's tag rejected valid native bulk bytevectors with `cons expected`.
+- Disabled the bulk-read callback while `port-data` contains bytes restored by `peek-u8`, preserving byte order before returning to the allocation-free bulk path.
+- Added regressions for a buffered byte followed by a bulk bytevector read and for an empty native bulk file write.
+
+### PR 3 validation
+
+- `cargo test -p stak-compiler --lib`: **6 tests passed**.
+- `cargo check -p stak --features std`: passed, including the proc-macro/compiler bootstrap.
+- `cargo test -p stak-file --features std --lib` with `TMPDIR=$PWD/target/stak-tmp`: **14 tests passed**.
+- `cargo test -p stak-r7rs --lib`: **3 tests passed**.
+- `./tools/integration_test.sh -f std -i stak features/types/port.feature` with the same `TMPDIR`: **37 scenarios and 115 steps passed**.
+- `cargo check -p stak-file --no-default-features`, `cargo fmt --all -- --check`, and `git diff --check`: passed.
+
+The compiler heap-size experiment was reverted: clean rebuilds confirmed that increasing the heap changed the allocation used by `compile_bare`, but even four times the normal heap still failed. The structural prelude correction fixed the failure at the default heap size.
+
+### PR3 follow-up validation
+
+- The first locked benchmark run exposed a size-dependent `number expected` failure in native bulk writes for bytevectors longer than 64 elements. The native traversal skipped the intermediate vector node's `car`, so it did not mirror the Scheme `vector-cell` walk. Corrected the traversal and added a 65-byte native file read/write regression at the chunk boundary.
+- Revalidated the corrected implementation: compiler tests, root std check, filesystem std/libc tests, R7RS tests, formatting, and diff checks passed; the port integration suite passed with 38 scenarios and 118 steps.
+- The locked I/O benchmark completed successfully after the correction. Representative 100,000-byte medians were approximately 176.76 KiB/s in-memory bytevector read, 285.53 KiB/s in-memory bytevector write, 258.77 KiB/s OS bytevector read, and 9.88 MiB/s OS bytevector write. Benchmark output includes VM/setup overhead and is a short 10-sample profile.
+
+## 2026-08-09 - PR3 review corrections and read-side bulk dispatch
+
+- Corrected `write-bytevector` to honor its optional `start` and `end` range for both native bulk callbacks and scalar callback ports.
+- Corrected `read-bytevector!` to return `0` for an empty range without probing the port, the number of bytes read for successful or partial reads, and the EOF object when no byte is available. `read-bytevector` now fills through the same bulk-capable path and trims short results.
+- Centralized public bytevector range handling: reversed ranges are rejected, while oversized `end` values are clamped to the bytevector length to preserve existing Stak behavior before native or scalar dispatch.
+- Fixed the two denied clippy lints (`needless_question_mark` and `missing_const_for_fn`).
+- Strengthened boundary coverage with scalar file readback, distinct markers at the 4096/4097 vector-height boundary, native/scalar write-range cases, and native/scalar read count/EOF cases.
+- Clarified that empty block-I/O buffers are successful no-ops for valid descriptors; implementations may validate descriptor and direction first.
+
+### PR3 review-correction validation
+
+- `cargo fmt --all -- --check`: passed.
+- `cargo clippy -p stak-file --all-features --lib -- -D warnings`: passed.
+- `cargo test -p stak-compiler --lib`: **6 tests passed**.
+- `cargo test -p stak-file --features std` with repository-local `TMPDIR`: **14 tests passed**.
+- `cargo test -p stak-file --features libc` with repository-local `TMPDIR`: **11 tests passed**.
+- `cargo test -p stak-r7rs` with repository-local `TMPDIR`: **3 tests passed**.
+- `cargo check -p stak --features std`: passed.
+- Complete non-extra port integration: **43 scenarios and 133 steps passed**.
+- `git diff --check`: passed.
+
+### Post-correction locked benchmark
+
+Command: `TMPDIR=$PWD/target/bench-tmp GOTMPDIR=$PWD/target/bench-tmp cargo bench -p stak-bench --bench io --locked -- --sample-size 10 --warm-up-time 0.2 --measurement-time 0.5`
+
+100,000-byte median throughput:
+
+- In-memory bytevector read: **443.71 KiB/s**.
+- In-memory bytevector write: **287.11 KiB/s**.
+- OS bytevector read: **10.02 MiB/s**.
+- OS bytevector write: **9.68 MiB/s**.
+
+The large OS read improvement confirms that `read-bytevector` now reaches the native bulk-read path rather than the scalar loop. All changes remain uncommitted.
+
+## 2026-08-09 - Codex read-side correctness follow-up
+
+- Removed scalar read lookahead: empty ranges now return `0` without touching the callback, and successful reads never probe beyond `end`.
+- Centralized public bytevector range handling. Reversed ranges now fail consistently; oversized `end` values are clamped to the bytevector length to preserve existing Stak behavior before either native or scalar dispatch.
+- Added a true native file bulk-read regression: the input is prepared with scalar writes, then distinct markers are read across the 64/65 and 4096/4097 vector boundaries, with count and EOF assertions plus scalar file verification.
+
+### Follow-up validation
+
+- Compiler tests: **6 passed**.
+- Filesystem std tests: **14 passed**.
+- Filesystem libc tests: **11 passed**.
+- R7RS tests: **3 passed**.
+- Root std check, formatting, Clippy, and `git diff --check`: passed.
+- Read feature suite: **93 scenarios / 479 steps passed**.
+- Port feature suite: **47 scenarios / 147 steps passed**.
+- Locked I/O benchmark: completed successfully with the repository-local temporary-directory setup.
+
+All changes remain uncommitted.

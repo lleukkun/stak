@@ -15,6 +15,10 @@ pub enum Primitive {
     ExistsFile,
     /// Flush a file.
     FlushFile,
+    /// Reads a bytevector from a file.
+    ReadFileBulk,
+    /// Writes a bytevector to a file.
+    WriteFileBulk,
 }
 
 impl Primitive {
@@ -25,4 +29,6 @@ impl Primitive {
     pub(super) const DELETE_FILE: usize = Self::DeleteFile as _;
     pub(super) const EXISTS_FILE: usize = Self::ExistsFile as _;
     pub(super) const FLUSH_FILE: usize = Self::FlushFile as _;
+    pub(super) const READ_FILE_BULK: usize = Self::ReadFileBulk as _;
+    pub(super) const WRITE_FILE_BULK: usize = Self::WriteFileBulk as _;
 }

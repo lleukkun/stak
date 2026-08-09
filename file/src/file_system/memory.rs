@@ -92,6 +92,26 @@ impl FileSystem for MemoryFileSystem<'_> {
         Err(FileError::Write)
     }
 
+    fn read_into(
+        &mut self,
+        descriptor: FileDescriptor,
+        destination: &mut [u8],
+    ) -> Result<usize, Self::Error> {
+        let entry = &mut self
+            .entries
+            .get_mut(descriptor)
+            .and_then(Option::as_mut)
+            .ok_or(FileError::Read)?;
+        let bytes = self.files.get(entry.file_index).ok_or(FileError::Read)?.1;
+        let available = bytes.len().saturating_sub(entry.offset);
+        let count = destination.len().min(available);
+
+        destination[..count].copy_from_slice(&bytes[entry.offset..entry.offset + count]);
+        entry.offset += count;
+
+        Ok(count)
+    }
+
     fn delete(&mut self, _: &Self::Path) -> Result<(), Self::Error> {
         Err(FileError::Delete)
     }
@@ -148,5 +168,25 @@ mod tests {
 
         assert!(system.exists(b"foo").unwrap());
         assert!(!system.exists(b"bar").unwrap());
+    }
+
+    #[test]
+    fn read_into() {
+        let mut entries = [Default::default(); 8];
+        let mut system = MemoryFileSystem::new(&[(b"foo", b"bar")], &mut entries);
+        let descriptor = system.open(b"foo", false).unwrap();
+        let mut destination = [0; 2];
+
+        assert_eq!(system.read_into(descriptor, &mut destination), Ok(2));
+        assert_eq!(&destination, b"ba");
+        assert_eq!(system.read_into(descriptor, &mut []), Ok(0));
+
+        let mut remainder = [0; 2];
+        assert_eq!(system.read_into(descriptor, &mut remainder), Ok(1));
+        assert_eq!(&remainder[..1], b"r");
+        assert_eq!(system.read_into(descriptor, &mut remainder), Ok(0));
+
+        system.close(descriptor).unwrap();
+        assert!(system.read_into(descriptor, &mut remainder).is_err());
     }
 }

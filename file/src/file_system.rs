@@ -43,6 +43,45 @@ pub trait FileSystem {
     /// Writes a file.
     fn write(&mut self, descriptor: FileDescriptor, byte: u8) -> Result<(), Self::Error>;
 
+    /// Reads up to the length of `destination` bytes.
+    ///
+    /// A successful read may be short, and EOF is reported as `Ok(0)`. For
+    /// a valid readable descriptor, an empty destination is a successful
+    /// no-op. Implementations may validate the descriptor and direction
+    /// before applying that no-op. The default implementation preserves
+    /// compatibility with scalar-only filesystems.
+    fn read_into(
+        &mut self,
+        descriptor: FileDescriptor,
+        destination: &mut [u8],
+    ) -> Result<usize, Self::Error> {
+        let mut count = 0;
+
+        while count < destination.len() {
+            let Some(byte) = self.read(descriptor)? else {
+                break;
+            };
+
+            destination[count] = byte;
+            count += 1;
+        }
+
+        Ok(count)
+    }
+
+    /// Writes all bytes in `source` or returns an error.
+    ///
+    /// An empty source is a successful no-op. The default implementation
+    /// preserves compatibility with scalar-only filesystems by forwarding each
+    /// byte to `write`.
+    fn write_from(&mut self, descriptor: FileDescriptor, source: &[u8]) -> Result<(), Self::Error> {
+        for &byte in source {
+            self.write(descriptor, byte)?;
+        }
+
+        Ok(())
+    }
+
     /// Flushes a file.
     fn flush(&mut self, descriptor: FileDescriptor) -> Result<(), Self::Error>;
 
