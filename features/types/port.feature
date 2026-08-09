@@ -282,3 +282,98 @@ Feature: Port
       """
     When I successfully run `stak main.scm`
     Then the stdout should contain exactly "A"
+
+  Scenario: Preserve string output across the chunk boundary
+    Given a file named "main.scm" with:
+      """scheme
+      (import (scheme base))
+
+      (define port (open-output-string))
+      (do ((index 0 (+ index 1)))
+        ((= index 65))
+        (write-u8 65 port))
+
+      (define first (get-output-string port))
+      (define first-length (string-length first))
+      (define first-at-zero (char->integer (string-ref first 0)))
+      (define first-at-63 (char->integer (string-ref first 63)))
+      (define first-at-64 (char->integer (string-ref first 64)))
+      (define second (get-output-string port))
+      (define same-output? (equal? first second))
+
+      (write-u8 66 port)
+      (define third (get-output-string port))
+
+      (write-u8
+        (if (and (= first-length 65)
+                 (= first-at-zero 65)
+                 (= first-at-63 65)
+                 (= first-at-64 65)
+                 same-output?
+                 (= (string-length third) 66)
+                 (= (char->integer (string-ref third 65)) 66))
+            65
+            66))
+      """
+    When I successfully run `stak main.scm`
+    Then the stdout should contain exactly "A"
+
+  Scenario: Read UTF-8 string input across a long source
+    Given a file named "main.scm" with:
+      """scheme
+      (import (scheme base))
+
+      (define source
+        (string-append "A" (make-string 62 #\\a) "あ😄"))
+
+      (define port (open-input-string source))
+      (define at-zero (read-u8 port))
+      (do ((index 1 (+ index 1)))
+        ((= index 63))
+        (read-u8 port))
+      (define at-63-a (read-u8 port))
+      (define at-63-b (read-u8 port))
+      (define at-63-c (read-u8 port))
+      (define at-64-a (read-u8 port))
+      (define at-64-b (read-u8 port))
+      (define at-64-c (read-u8 port))
+      (define at-64-d (read-u8 port))
+      (define eof (read-u8 port))
+
+      (write-u8
+        (if (and (= at-zero 65)
+                 (= at-63-a 227)
+                 (= at-63-b 129)
+                 (= at-63-c 130)
+                 (= at-64-a 240)
+                 (= at-64-b 159)
+                 (= at-64-c 152)
+                 (= at-64-d 132)
+                 (eof-object? eof))
+            65
+            66))
+      """
+    When I successfully run `stak main.scm`
+    Then the stdout should contain exactly "A"
+
+  Scenario: Retrieve string output incrementally without rescanning
+    Given a file named "main.scm" with:
+      """scheme
+      (import (scheme base))
+
+      (define port (open-output-string))
+      (do ((index 0 (+ index 1)))
+        ((= index 1000))
+        (write-u8 65 port)
+        (get-output-string port))
+
+      (define result (get-output-string port))
+      (write-u8
+        (if (and (= (string-length result) 1000)
+                 (= (char->integer (string-ref result 0)) 65)
+                 (= (char->integer (string-ref result 999)) 65))
+            65
+            66))
+      """
+    When I successfully run `stak main.scm`
+    Then the stdout should contain exactly "A"

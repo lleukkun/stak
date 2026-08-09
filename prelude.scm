@@ -2385,6 +2385,27 @@
 
     ; In-memory ports
 
+    (define (char->utf8-bytes x)
+      (let ((integer (char->integer x)))
+        (cond
+          ((< integer 128)
+            (list integer))
+          ((< integer 2048)
+            (list
+              (+ 192 (quotient integer 64))
+              (+ 128 (remainder integer 64))))
+          ((< integer 65536)
+            (list
+              (+ 224 (quotient integer 4096))
+              (+ 128 (remainder (quotient integer 64) 64))
+              (+ 128 (remainder integer 64))))
+          (else
+            (list
+              (+ 240 (quotient integer 262144))
+              (+ 128 (remainder (quotient integer 4096) 64))
+              (+ 128 (remainder (quotient integer 64) 64))
+              (+ 128 (remainder integer 64)))))))
+
     (define (open-input-string xs)
       (let ((xs (string->code-points xs))
             (ys '()))
@@ -2393,10 +2414,8 @@
             (when (and
                    (null? ys)
                    (not (null? xs)))
-              (let ((port (open-output-bytevector)))
-                (write-char (integer->char (car xs)) port)
-                (set! xs (cdr xs))
-                (set! ys (bytevector->list (get-output-bytevector port)))))
+              (set! ys (char->utf8-bytes (integer->char (car xs))))
+              (set! xs (cdr xs)))
             (and
               (pair? ys)
               (let ((y (car ys)))
@@ -2404,24 +2423,52 @@
                 y)))
           (lambda () #f))))
 
-    (define (open-output-string)
-      (let* ((xs (string))
-             (tail xs)
-             (port (open-output-bytevector)))
-        (make-output-port
-          (lambda (x)
-            (write-u8 x port)
-            (let ((x (read-char (open-input-bytevector (get-output-bytevector port)))))
-              (when (char? x)
-                (set! port (open-output-bytevector))
-                (set-car! xs (+ 1 (string-length xs)))
-                (set-cdr! tail (list (char->integer x)))
-                (set! tail (cdr tail)))))
-          (lambda () #f)
-          (lambda () #f)
-          xs)))
+    (define (output-string-continuation-count byte)
+      (cond
+        ((= (quotient byte 32) 6) 1)
+        ((= (quotient byte 16) 14) 2)
+        (else 3)))
 
-    (define get-output-string port-data)
+    (define (append-output-string-char result tail char)
+      (set-car! result (+ 1 (string-length result)))
+      (set-cdr! tail (list (char->integer char)))
+      (cdr tail))
+
+    (define (open-output-string)
+      (let* ((result (string))
+             (tail result)
+             (pending '())
+             (remaining 0))
+        (make-output-port
+          (lambda (byte)
+            (if (zero? remaining)
+              (if (< byte 128)
+                (set! tail
+                  (append-output-string-char
+                    result
+                    tail
+                    (integer->char byte)))
+                (begin
+                  (set! pending (list byte))
+                  (set! remaining
+                    (output-string-continuation-count byte))))
+              (begin
+                (set! pending (cons byte pending))
+                (set! remaining (- remaining 1))
+                (when (zero? remaining)
+                  (let ((char (parse-char-bytes (reverse pending))))
+                    (when (char? char)
+                      (set! tail
+                        (append-output-string-char result tail char))))
+                  (set! pending '())))))
+          (lambda () #f)
+          (lambda () #f)
+          (lambda () result))))
+
+    (define (get-output-string port)
+      (let ((get (port-data port)))
+        (get)))
+
 
     (define (open-input-bytevector xs)
       (let ((index 0)
