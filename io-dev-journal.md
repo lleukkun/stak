@@ -332,3 +332,30 @@ The changes remain uncommitted; unrelated untracked files remain untouched.
 - Direct checks produced `��A` and `���A` for the two partial-prefix cases. Interleaved multibyte retrieval measured approximately 0.02s, 0.03s, and 0.06s for 1,000, 2,000, and 5,000 characters.
 
 The changes remain uncommitted; unrelated untracked files remain untouched.
+
+## 2026-08-09 - Post-commit IO benchmark rerun
+
+The IO benchmark was rerun after commit `89bf4fd5` using the established fast Criterion profile:
+
+```sh
+TMPDIR=$PWD/target/bench-tmp GOTMPDIR=$PWD/target/bench-tmp \
+cargo bench -p stak-bench --bench io --locked -- \
+  --sample-size 10 --warm-up-time 0.2 --measurement-time 0.5
+```
+
+The first attempt used relative temporary paths and failed when the filesystem benchmark resolved them below the benchmark crate directory. The absolute-path rerun completed successfully. Current 100k payload throughput compared with the original values in `io-benchmark-results.txt`:
+
+| Case | Original | Current | Change |
+| --- | ---: | ---: | ---: |
+| In-memory ASCII read | 279.30 KiB/s | 450.31 KiB/s | +61.2% |
+| In-memory ASCII write | 256.53 KiB/s | 557.19 KiB/s | +117.2% |
+| In-memory UTF-8 read | 367.51 KiB/s | 393.99 KiB/s | +7.2% |
+| In-memory UTF-8 write | 275.11 KiB/s | 576.48 KiB/s | +109.5% |
+| OS ASCII read | 654.99 KiB/s | 731.20 KiB/s | +11.6% |
+| OS ASCII write | 369.93 KiB/s | 695.54 KiB/s | +88.0% |
+| OS UTF-8 read | 698.37 KiB/s | 566.98 KiB/s | -18.8% |
+| OS UTF-8 write | 444.42 KiB/s | 1,129.6 KiB/s | +154.2% |
+
+Bytevector throughput also improved from the original run: in-memory read/write moved from 140.59/250.12 KiB/s to 174.13/274.03 KiB/s, while OS read/write moved from 225.51/194.12 KiB/s to 245.05/817.96 KiB/s.
+
+These figures include VM setup and Scheme execution, and the short 10-sample profile is sensitive to normal system variance. The multibyte interleaved retrieval workload remained linear at approximately 0.02s, 0.03s, and 0.06s for 1,000, 2,000, and 5,000 characters. No source or test files were changed by the benchmark run.
