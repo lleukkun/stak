@@ -125,6 +125,7 @@
     char?
     integer->char
     char->integer
+
     char=?
     char<?
     char<=?
@@ -2024,6 +2025,149 @@
           x
           (set! x (convert (car rest))))))))
 
+(define-library (stak utf8)
+  (export
+    utf8-replacement-code-point
+    utf8-sequence-length
+    utf8-continuation-byte?
+    utf8-valid-sequence?
+    utf8-code-point
+    decode-utf8-bytes-replacement
+    decode-utf8-bytes-strict
+    encode-utf8-code-points)
+  (import (stak base))
+  (begin
+    (define utf8-replacement-code-point 65533)
+
+    (define (utf8-sequence-length byte)
+      (cond
+        ((< byte 128) 1)
+        ((and (>= byte 194) (< byte 224)) 2)
+        ((and (>= byte 224) (< byte 240)) 3)
+        ((and (>= byte 240) (< byte 245)) 4)
+        (else 0)))
+
+    (define (utf8-continuation-byte? byte)
+      (and (number? byte) (>= byte 128) (< byte 192)))
+
+    (define (utf8-valid-sequence? bytes)
+      (if (null? bytes)
+        #f
+        (let ((length (length bytes)) (lead (car bytes)))
+          (cond
+            ((= length 1)
+              (< lead 128))
+            ((= length 2)
+              (and
+                (>= lead 194)
+                (< lead 224)
+                (utf8-continuation-byte? (cadr bytes))))
+            ((= length 3)
+              (let ((second (cadr bytes))
+                    (third (car (cdr (cdr bytes)))))
+                (and
+                  (>= lead 224)
+                  (< lead 240)
+                  (utf8-continuation-byte? second)
+                  (utf8-continuation-byte? third)
+                  (or
+                    (and (= lead 224) (>= second 160))
+                    (and (= lead 237) (< second 160))
+                    (and (not (= lead 224)) (not (= lead 237)))))))
+            ((= length 4)
+              (let ((second (cadr bytes))
+                    (third (car (cdr (cdr bytes))))
+                    (fourth (car (cdr (cdr (cdr bytes))))))
+                (and
+                  (>= lead 240)
+                  (< lead 245)
+                  (utf8-continuation-byte? second)
+                  (utf8-continuation-byte? third)
+                  (utf8-continuation-byte? fourth)
+                  (or
+                    (and (= lead 240) (>= second 144))
+                    (and (= lead 244) (< second 144))
+                    (and (not (= lead 240)) (not (= lead 244)))))))
+            (else #f)))))
+
+    (define (utf8-code-point bytes)
+      (let ((lead (car bytes)))
+        (cond
+          ((= (length bytes) 1)
+            lead)
+          ((= (length bytes) 2)
+            (+
+              (* (- lead 192) 64)
+              (- (cadr bytes) 128)))
+          ((= (length bytes) 3)
+            (+
+              (* (- lead 224) 4096)
+              (* (- (cadr bytes) 128) 64)
+              (- (car (cdr (cdr bytes))) 128)))
+          (else
+            (+
+              (* (- lead 240) 262144)
+              (* (- (cadr bytes) 128) 4096)
+              (* (- (car (cdr (cdr bytes))) 128) 64)
+              (- (car (cdr (cdr (cdr bytes)))) 128))))))
+
+    (define (utf8-prefix bytes length)
+      (let loop ((bytes bytes) (length length) (prefix '()))
+        (if (zero? length)
+          (cons (reverse prefix) bytes)
+          (if (null? bytes)
+            #f
+            (loop (cdr bytes) (- length 1) (cons (car bytes) prefix))))))
+
+    (define (decode-utf8-bytes bytes strict?)
+      (let loop ((bytes bytes) (code-points '()))
+        (if (null? bytes)
+          (reverse code-points)
+          (let ((length (utf8-sequence-length (car bytes))))
+            (if (zero? length)
+              (if strict?
+                #f
+                (loop (cdr bytes) (cons utf8-replacement-code-point code-points)))
+              (let ((prefix (utf8-prefix bytes length)))
+                (if (and prefix (utf8-valid-sequence? (car prefix)))
+                  (loop
+                    (cdr prefix)
+                    (cons (utf8-code-point (car prefix)) code-points))
+                  (if strict?
+                    #f
+                    (loop
+                      (cdr bytes)
+                      (cons utf8-replacement-code-point code-points))))))))))
+
+    (define (decode-utf8-bytes-replacement bytes)
+      (decode-utf8-bytes bytes #f))
+
+    (define (decode-utf8-bytes-strict bytes)
+      (decode-utf8-bytes bytes #t))
+
+    (define (encode-utf8-code-point code-point)
+      (cond
+        ((< code-point 128)
+          (list code-point))
+        ((< code-point 2048)
+          (list
+            (+ 192 (quotient code-point 64))
+            (+ 128 (remainder code-point 64))))
+        ((< code-point 65536)
+          (list
+            (+ 224 (quotient code-point 4096))
+            (+ 128 (remainder (quotient code-point 64) 64))
+            (+ 128 (remainder code-point 64))))
+        (else
+          (list
+            (+ 240 (quotient code-point 262144))
+            (+ 128 (remainder (quotient code-point 4096) 64))
+            (+ 128 (remainder (quotient code-point 64) 64))
+            (+ 128 (remainder code-point 64))))))
+
+    (define (encode-utf8-code-points code-points)
+      (apply append (map encode-utf8-code-point code-points)))))
+
 (define-library (stak io)
   (export
     eof-object
@@ -2078,6 +2222,7 @@
 
   (import
     (stak base)
+    (stak utf8)
     (stak string)
     (stak vector)
     (stak parameter))
@@ -2200,49 +2345,28 @@
       (apply peek-u8 rest)
       #t)
 
-    (define (utf8-continuation-count byte)
-      (cond
-        ((= (quotient byte 32) 6) 1)
-        ((= (quotient byte 16) 14) 2)
-        (else 3)))
-
+    (define utf8-replacement-character (integer->char utf8-replacement-code-point))
+    (define (restore-input-bytes! port bytes) (unless (null? bytes) (port-set-data! port (append bytes (port-data port)))))
     (define (read-char-bytes port)
       (let ((byte (read-u8 port)))
         (cond
-          ((eof-object? byte)
-            '())
-          ((zero? (quotient byte 128))
-            (list byte))
+          ((eof-object? byte) '())
+          ((= (utf8-sequence-length byte) 1) (list byte))
+          ((zero? (utf8-sequence-length byte)) (list byte))
           (else
-            (let* ((count (utf8-continuation-count byte))
-                   (bytes
-                     (let loop ((count count))
-                       (if (zero? count)
-                         '()
-                         (let ((x (read-u8 port)))
-                           (and
-                             (number? x)
-                             (let ((xs (loop (- count 1))))
-                               (and xs (cons x xs)))))))))
-              (if bytes
-                (cons byte bytes)
-                '()))))))
-
+            (let loop ((remaining (- (utf8-sequence-length byte) 1)) (bytes (list byte)))
+              (if (zero? remaining)
+                (if (utf8-valid-sequence? bytes) bytes
+                  (begin (restore-input-bytes! port (cdr bytes)) (list byte)))
+                (let ((x (read-u8 port)))
+                  (if (eof-object? x)
+                    (begin (restore-input-bytes! port (cdr bytes)) (list byte))
+                    (if (utf8-continuation-byte? x)
+                      (loop (- remaining 1) (append bytes (list x)))
+                      (begin (restore-input-bytes! port (append (cdr bytes) (list x))) (list byte)))))))))))
     (define (parse-char-bytes bytes)
-      (cond
-        ((null? bytes)
-          (eof-object))
-        ((null? (cdr bytes))
-          (integer->char (car bytes)))
-        (else
-          (integer->char
-            (let loop ((bytes (cdr bytes)) (code (car bytes)) (size 64))
-              (if (null? bytes)
-                (remainder code size)
-                (loop
-                  (cdr bytes)
-                  (+ (* 64 code) (- (car bytes) 128))
-                  (* size 32))))))))
+      (if (null? bytes) (eof-object)
+        (if (utf8-valid-sequence? bytes) (integer->char (utf8-code-point bytes)) utf8-replacement-character)))
 
     (define (read-char . rest)
       (let ((xs (read-char-bytes (get-input-port rest))))
@@ -2420,28 +2544,39 @@
              (tail result)
              (pending '())
              (remaining 0))
-        (make-output-port
-          (lambda (byte)
-            (if (zero? remaining)
-              (if (< byte 128)
-                (set! tail
-                  (append-output-string-char
-                    result
-                    tail
-                    (integer->char byte)))
-                (begin
-                  (set! pending (list byte))
-                  (set! remaining
-                    (utf8-continuation-count byte))))
+        (define (emit char)
+          (set! tail (append-output-string-char result tail char)))
+        (define (emit-replacements bytes)
+          (for-each
+            (lambda (byte)
+              (emit utf8-replacement-character))
+            bytes))
+        (define (consume byte)
+          (if (zero? remaining)
+            (cond
+              ((< byte 128)
+                (emit (integer->char byte)))
+              ((zero? (utf8-sequence-length byte))
+                (emit utf8-replacement-character))
+              (else
+                (set! pending (list byte))
+                (set! remaining (- (utf8-sequence-length byte) 1))))
+            (if (utf8-continuation-byte? byte)
               (begin
-                (set! pending (cons byte pending))
+                (set! pending (append pending (list byte)))
                 (set! remaining (- remaining 1))
                 (when (zero? remaining)
-                  (let ((char (parse-char-bytes (reverse pending))))
-                    (when (char? char)
-                      (set! tail
-                        (append-output-string-char result tail char))))
-                  (set! pending '())))))
+                  (if (utf8-valid-sequence? pending)
+                    (emit (integer->char (utf8-code-point pending)))
+                    (emit-replacements pending))
+                  (set! pending '())))
+              (begin
+                (emit-replacements pending)
+                (set! pending '())
+                (set! remaining 0)
+                (consume byte)))))
+        (make-output-port
+          consume
           (lambda () #f)
           (lambda () #f)
           (lambda () result))))
@@ -2449,7 +2584,6 @@
     (define (get-output-string port)
       (let ((get (port-data port)))
         (get)))
-
 
     (define (open-input-bytevector xs)
       (let ((index 0)
@@ -2498,24 +2632,23 @@
 
     (define (get-output-bytevector port)
       (let ((get (port-data port)))
-        (get)))
-
-    ))
+        (get)))))
 
 (define-library (stak unicode)
   (export string->utf8 utf8->string)
 
-  (import (stak base) (stak io))
+  (import (stak base) (stak utf8) (stak string) (stak vector))
 
   (begin
-    ; TODO Use the `expt` procedure.
-    (define limit (* 1024 1024 1024 1024))
-
     (define (string->utf8 xs)
-      (read-bytevector limit (open-input-string xs)))
+      (list->bytevector
+        (encode-utf8-code-points (string->code-points xs))))
 
     (define (utf8->string xs)
-      (read-string limit (open-input-bytevector xs)))))
+      (let ((code-points (decode-utf8-bytes-strict (bytevector->list xs))))
+        (if code-points
+          (code-points->string code-points)
+          (error "invalid UTF-8 byte sequence" xs))))))
 
 (define-library (stak continue)
   (export

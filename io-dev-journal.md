@@ -300,3 +300,35 @@ The run completed successfully with `TMPDIR=target/bench-tmp`. The 27-scenario p
 Strict UTF-8 validation remains a separate medium-sized change. The current decoder still does not reject invalid continuation bytes, overlong encodings, surrogate values, or code points above `U+10FFFF`. Implementing that safely requires choosing compatible behavior for malformed and incomplete sequences across `read-char`, `peek-char`, `read-string`, `utf8->string`, and incremental `open-output-string` decoding. No strict-validation behavior was changed in this consolidation.
 
 The encoder and continuation-count changes are ready for review in the current work-in-progress commit. Unrelated untracked files remain untouched.
+
+## 2026-08-09 - UTF-8 review follow-up
+
+- Replaced output-string list append and getter rescanning with a mutable string plus tail pointer; each emitted character is appended once, and pending UTF-8 state is bounded to at most four bytes.
+- Changed streaming character framing to classify each continuation byte as it arrives. The first non-continuation byte is restored immediately, so a known-invalid prefix such as `E2 41` does not read past `41`.
+- Made the public list-level decoder policy explicit with `decode-utf8-bytes-replacement` and `decode-utf8-bytes-strict`; `utf8->string` uses strict decoding and replacement-oriented paths remain explicit.
+- Added regression scenarios for overlong, truncated, surrogate, out-of-range, and invalid-lead UTF-8 rejection, plus a custom input-port test proving `E2 41` returns replacement then `A` with exactly two underlying reads.
+- `features/types/string.feature` and `features/types/port.feature`: **193 scenarios and 582 steps passed** together.
+- `cargo build -p stak --profile release_test --features std` passed; `git diff --check` passed.
+
+The changes remain uncommitted. Unrelated untracked files remain untouched.
+
+## 2026-08-09 - UTF-8 decoder composition fixes
+
+- Output-string retrieval now projects incomplete pending bytes without mutating decoder state, so retrieval between bytes no longer changes a sequence that later completes.
+- Replacement recovery consumes one malformed byte at a time consistently: complete invalid prefixes emit one replacement per byte, and incomplete prefixes project or eventually produce one replacement per consumed byte.
+- Added differential coverage comparing `read-char`, `decode-utf8-bytes-replacement`, and `open-output-string`, including three-/four-byte overlong forms, isolated continuation bytes, valid UTF-8 boundaries, retrieval between bytes, and repeated malformed `peek-char` calls.
+- Focused port/string validation: **196 scenarios and 591 steps passed**.
+- Full standard integration validation: **1,780 scenarios and 5,737 steps passed**. The read suite remains at **93 scenarios and 479 steps passed**.
+- `cargo build -p no-std-no-alloc --profile release_test`, `cargo build -p stak --profile release_test --features std`, formatter, and `git diff --check` passed.
+
+The changes remain uncommitted; unrelated untracked files remain untouched.
+
+## 2026-08-09 - UTF-8 partial-prefix and retrieval scaling follow-up
+
+- Input recovery now restores every consumed continuation prefix plus the first non-continuation in original order. `E2 82 41` and `F0 90 80 41` therefore decode as one replacement per malformed byte followed by `A`.
+- Incomplete output bytes remain pending and invisible to `get-output-string` until a sequence completes. This preserves continued writes and keeps retrieval O(1), including interleaved retrieval during multibyte output.
+- Added regressions for partial-prefix interruption, final output length, and 1,000-character multibyte retrieval interleaving.
+- Focused port/string validation: **197 scenarios and 594 steps passed**.
+- Direct checks produced `��A` and `���A` for the two partial-prefix cases. Interleaved multibyte retrieval measured approximately 0.02s, 0.03s, and 0.06s for 1,000, 2,000, and 5,000 characters.
+
+The changes remain uncommitted; unrelated untracked files remain untouched.

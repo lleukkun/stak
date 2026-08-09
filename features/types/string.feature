@@ -492,3 +492,73 @@ Feature: String
       | AB     | #\\a 1    | Aa     |
       | ABC    | #\\a      | aaa    |
       | ABCD   | #\\a 1 3  | AaaD   |
+
+  Scenario: Reject malformed UTF-8 in utf8->string
+    Given a file named "main.scm" with:
+      """scheme
+      (import (scheme base))
+
+      (define (rejects? bytes)
+        (guard (condition (else #t))
+          (utf8->string (list->bytevector bytes))
+          #f))
+
+      (write-u8
+        (if (and (rejects? '(192 128))
+                 (rejects? '(226 128))
+                 (rejects? '(237 160 128))
+                 (rejects? '(244 144 128 128))
+                 (rejects? '(245 128 128 128)))
+            65
+            66))
+      """
+    When I successfully run `stak main.scm`
+    Then the stdout should contain exactly "A"
+
+  Scenario: Match replacement decoding across input, batch, and output
+    Given a file named "main.scm" with:
+      """scheme
+      (import (scheme base) (stak utf8))
+
+      (define (read-all bytes)
+        (let ((port (open-input-bytevector (list->bytevector bytes))))
+          (let loop ((chars '()))
+            (let ((char (read-char port)))
+              (if (eof-object? char)
+                (list->string (reverse chars))
+                (loop (cons char chars)))))))
+
+      (define (batch bytes)
+        (list->string
+          (map integer->char (decode-utf8-bytes-replacement bytes))))
+
+      (define (output bytes)
+        (let ((port (open-output-string)))
+          (for-each (lambda (byte) (write-u8 byte port)) bytes)
+          (get-output-string port)))
+
+      (define (same? bytes)
+        (let ((expected (read-all bytes)))
+          (and (string=? expected (batch bytes))
+               (string=? expected (output bytes)))))
+
+      (write-u8
+        (if (and
+              (same? '(224 128 128))
+              (same? '(240 128 128 128))
+              (same? '(226 130 65))
+              (same? '(240 144 128 65))
+              (same? '(128))
+              (same? '(194 128))
+              (same? '(223 191))
+              (same? '(224 160 128))
+              (same? '(237 159 191))
+              (same? '(238 128 128))
+              (same? '(239 191 191))
+              (same? '(240 144 128 128))
+              (same? '(244 143 191 191)))
+            65
+            66))
+      """
+    When I successfully run `stak main.scm`
+    Then the stdout should contain exactly "A"

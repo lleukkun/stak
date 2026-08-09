@@ -377,3 +377,106 @@ Feature: Port
       """
     When I successfully run `stak main.scm`
     Then the stdout should contain exactly "A"
+
+  Scenario: Stop reading after an invalid UTF-8 continuation
+    Given a file named "main.scm" with:
+      """scheme
+      (import (scheme base))
+
+      (define reads 0)
+      (define source '(226 65))
+      (define port
+        (make-input-port
+          (lambda ()
+            (set! reads (+ reads 1))
+            (if (pair? source)
+                (let ((byte (car source)))
+                  (set! source (cdr source))
+                  byte)
+                (error "read past known-invalid UTF-8")))
+          (lambda () #f)))
+
+      (define replacement (read-char port))
+      (define ascii (read-char port))
+      (write-u8
+        (if (and (= (char->integer replacement) 65533)
+                 (char=? ascii #\A)
+                 (= reads 2))
+            65
+            66))
+      """
+    When I successfully run `stak main.scm`
+    Then the stdout should contain exactly "A"
+
+  Scenario: Preserve UTF-8 decoding across output retrieval
+    Given a file named "main.scm" with:
+      """scheme
+      (import (scheme base))
+
+      (define port (open-output-string))
+      (write-u8 226 port)
+      (define first (get-output-string port))
+      (define first-length (string-length first))
+      (write-u8 130 port)
+      (define second (get-output-string port))
+      (define second-length (string-length second))
+      (write-u8 172 port)
+      (define final (get-output-string port))
+      (define final-length (string-length final))
+
+      (write-u8
+        (if (and (= first-length 0)
+                 (= second-length 0)
+                 (= final-length 1)
+                 (= (char->integer (string-ref final 0)) 8364))
+            65
+            66))
+      """
+    When I successfully run `stak main.scm`
+    Then the stdout should contain exactly "A"
+
+  Scenario: Repeat peek-char on truncated UTF-8
+    Given a file named "main.scm" with:
+      """scheme
+      (import (scheme base))
+
+      (define port (open-input-bytevector (list->bytevector '(226 130))))
+      (define first (peek-char port))
+      (define second (peek-char port))
+      (define third (read-char port))
+
+      (write-u8
+        (if (and (= (char->integer first) 65533)
+                 (= (char->integer second) 65533)
+                 (= (char->integer third) 65533))
+            65
+            66))
+      """
+    When I successfully run `stak main.scm`
+    Then the stdout should contain exactly "A"
+
+  Scenario: Retrieve multibyte output incrementally without rescanning
+    Given a file named "main.scm" with:
+      """scheme
+      (import (scheme base))
+
+      (define port (open-output-string))
+      (do ((index 0 (+ index 1)))
+        ((= index 1000))
+        (write-u8 227 port)
+        (get-output-string port)
+        (write-u8 129 port)
+        (get-output-string port)
+        (write-u8 130 port)
+        (get-output-string port))
+
+      (define result (get-output-string port))
+      (write-u8
+        (if (and (= (string-length result) 1000)
+                 (= (char->integer (string-ref result 0)) 12354)
+                 (= (char->integer (string-ref result 999)) 12354))
+            65
+            66))
+      """
+    When I successfully run `stak main.scm`
+    Then the stdout should contain exactly "A"
