@@ -381,6 +381,23 @@ Feature: Read
       | #u8(1 2)        |
       | #u8(1 2 3)      |
 
+  @stak
+  Scenario: Read after Unicode whitespace
+    Given a file named "main.scm" with:
+      """scheme
+      (import (scheme base) (scheme read))
+
+      (write-u8 (if (equal? (read) 'foo) 65 66))
+      """
+    And a file named "input.txt" with:
+      """text
+      　foo
+      """
+    When I run `stak main.scm` interactively
+    And I pipe in the file "input.txt"
+    Then the exit status should be 0
+    And the stdout should contain exactly "A"
+
   Scenario: Read from a port
     Given a file named "main.scm" with:
       """scheme
