@@ -12,11 +12,16 @@ use stak_native::{
 };
 use stak_process_context::{ProcessContext, ProcessContextPrimitiveSet};
 use stak_time::{Clock, TimePrimitiveSet};
-use stak_vm::{Cons, Heap, Memory, Number, PrimitiveSet, Tag, Type, Value};
+use stak_vm::{
+    Cons, Heap, ListVectorCursor, Memory, Number, PrimitiveSet, Tag, Type, Value, list_vector_cell,
+};
 use winter_maybe_async::{maybe_async, maybe_await};
 
 const BYTEVECTOR_TAG: Tag = 8;
+const STRING_TAG: Tag = 5;
 const VECTOR_FACTOR: usize = 64;
+const UTF8_BUFFER_SIZE: usize = 512;
+const UTF8_REPLACEMENT_CODE_POINT: u32 = 0xfffd;
 
 /// A primitive set that covers [the R7RS small](https://standards.scheme.org/corrected-r7rs/r7rs.html).
 pub struct SmallPrimitiveSet<D: Device, F: FileSystem, P: ProcessContext, C: Clock> {
@@ -130,6 +135,34 @@ impl<D: Device, F: FileSystem, P: ProcessContext, C: Clock> SmallPrimitiveSet<D,
         Ok(())
     }
 
+    fn make_string<H: Heap>(memory: &mut Memory<H>) -> Result<(), Error> {
+        let [length, fill] = memory.pop_many()?;
+        let length = Self::nonnegative_integer(Number::try_from(length)?)?;
+        let fill = Number::try_from(fill)?;
+        code_point(fill)?;
+
+        memory.push(memory.null()?.into())?;
+        for _ in 0..length {
+            let code_points = memory
+                .top()?
+                .to_cons()
+                .ok_or(stak_vm::Error::ConsExpected)?;
+            let code_points = memory.cons(fill.into(), code_points)?;
+            memory.set_top(code_points.into())?;
+        }
+
+        let code_points = memory
+            .top()?
+            .to_cons()
+            .ok_or(stak_vm::Error::ConsExpected)?;
+        let string = memory.allocate(
+            Number::from_i64(length as _).into(),
+            code_points.set_tag(STRING_TAG).into(),
+        )?;
+        memory.set_top(string.into())?;
+        Ok(())
+    }
+
     fn nonnegative_integer(number: Number) -> Result<usize, Error> {
         let float = number.to_f64();
         let integer = number.to_i64();
@@ -185,21 +218,390 @@ impl<D: Device, F: FileSystem, P: ProcessContext, C: Clock> SmallPrimitiveSet<D,
                 )?;
             }
         } else {
-            for offset in 0..count {
-                let byte =
-                    bytevector_get(memory, source_root, source_length, source_start + offset)?;
-                bytevector_set(
-                    memory,
-                    destination_root,
-                    destination_length,
-                    destination_offset + offset,
-                    byte,
-                )?;
+            let source_root = source_root.to_cons().ok_or(stak_vm::Error::ConsExpected)?;
+            let destination_root = destination_root
+                .to_cons()
+                .ok_or(stak_vm::Error::ConsExpected)?;
+            let mut source = (count > 0)
+                .then(|| {
+                    ListVectorCursor::<VECTOR_FACTOR>::new(
+                        memory,
+                        source_root,
+                        source_length,
+                        source_start,
+                    )
+                })
+                .transpose()?;
+            let mut destination = (count > 0)
+                .then(|| {
+                    ListVectorCursor::<VECTOR_FACTOR>::new(
+                        memory,
+                        destination_root,
+                        destination_length,
+                        destination_offset,
+                    )
+                })
+                .transpose()?;
+
+            for _ in 0..count {
+                let source = source.as_mut().unwrap().next(memory)?;
+                let byte = Number::try_from(memory.car(source)?)?.to_i64();
+                let byte = u8::try_from(byte).map_err(|_| stak_vm::Error::NumberExpected)?;
+                let destination = destination.as_mut().unwrap().next(memory)?;
+                memory.set_car(destination, Number::from_i64(i64::from(byte)).into())?;
             }
         }
 
         memory.push(memory.boolean(false)?.into())?;
         Ok(())
+    }
+
+    fn utf8_encoded_length<H: Heap>(memory: &mut Memory<H>) -> Result<(), Error> {
+        let [code_points] = memory.pop_many()?;
+        let mut code_points = code_points.to_cons().ok_or(stak_vm::Error::ConsExpected)?;
+        let null = memory.null()?;
+        let mut length = 0usize;
+
+        while code_points != null {
+            let code_point = Number::try_from(memory.car(code_points)?)?;
+            length = length
+                .checked_add(encode_utf8_code_point(code_point, &mut [0; 4])?)
+                .ok_or(stak_vm::Error::NumberExpected)?;
+            code_points = memory
+                .cdr(code_points)?
+                .to_cons()
+                .ok_or(stak_vm::Error::ConsExpected)?;
+        }
+
+        let length = i64::try_from(length).map_err(|_| stak_vm::Error::NumberExpected)?;
+        memory.push(Number::from_i64(length).into())?;
+        Ok(())
+    }
+
+    fn copy_code_points<H: Heap>(memory: &mut Memory<H>) -> Result<(), Error> {
+        let [source, maximum] = memory.pop_many()?;
+        let maximum = Self::nonnegative_integer(Number::try_from(maximum)?)?;
+
+        memory.push(source.to_cons().ok_or(stak_vm::Error::ConsExpected)?.into())?;
+        memory.push(memory.null()?.into())?;
+
+        let mut length = 0;
+        while length < maximum {
+            let source_slot = memory.tail(memory.stack(), 1)?;
+            let source = memory
+                .car(source_slot)?
+                .to_cons()
+                .ok_or(stak_vm::Error::ConsExpected)?;
+            if source == memory.null()? {
+                break;
+            }
+
+            let code_point = Number::try_from(memory.car(source)?)?;
+            let next = memory
+                .cdr(source)?
+                .to_cons()
+                .ok_or(stak_vm::Error::ConsExpected)?;
+            memory.set_car(source_slot, next.into())?;
+
+            let copied = memory
+                .top()?
+                .to_cons()
+                .ok_or(stak_vm::Error::ConsExpected)?;
+            let copied = memory.cons(code_point.into(), copied)?;
+            memory.set_top(copied.into())?;
+            length += 1;
+        }
+
+        let mut current = memory
+            .top()?
+            .to_cons()
+            .ok_or(stak_vm::Error::ConsExpected)?;
+        let tail = current;
+        let null = memory.null()?;
+        let mut head = null;
+        while current != null {
+            let next = memory
+                .cdr(current)?
+                .to_cons()
+                .ok_or(stak_vm::Error::ConsExpected)?;
+            memory.set_cdr(current, head.set_tag(Type::Pair as _).into())?;
+            head = current;
+            current = next;
+        }
+        memory.set_top(head.into())?;
+        memory.push(tail.into())?;
+
+        let head_slot = memory.tail(memory.stack(), 1)?;
+        let head = memory
+            .car(head_slot)?
+            .to_cons()
+            .ok_or(stak_vm::Error::ConsExpected)?;
+        let string = memory.allocate(
+            Number::from_i64(length as _).into(),
+            head.set_tag(STRING_TAG).into(),
+        )?;
+        let head_slot = memory.tail(memory.stack(), 1)?;
+        memory.set_car(head_slot, string.into())?;
+
+        let tail = memory
+            .top()?
+            .to_cons()
+            .ok_or(stak_vm::Error::ConsExpected)?;
+        let source_slot = memory.tail(memory.stack(), 2)?;
+        let source = memory
+            .car(source_slot)?
+            .to_cons()
+            .ok_or(stak_vm::Error::ConsExpected)?;
+        let metadata = memory.cons(tail.into(), source)?;
+        let string_slot = memory.tail(memory.stack(), 1)?;
+        let string = memory.car(string_slot)?;
+        let result = memory.cons(string, metadata)?;
+
+        for _ in 0..3 {
+            memory.pop()?;
+        }
+        memory.push(result.into())?;
+        Ok(())
+    }
+
+    fn utf8_encode<H: Heap>(memory: &mut Memory<H>) -> Result<(), Error> {
+        let [code_points, destination, start, end] = memory.pop_many()?;
+        let mut code_points = code_points.to_cons().ok_or(stak_vm::Error::ConsExpected)?;
+        let start = Self::nonnegative_integer(Number::try_from(start)?)?;
+        let end = Self::nonnegative_integer(Number::try_from(end)?)?;
+        let (root, length) = bytevector_info(memory, destination)?;
+        if start > end || end > length {
+            return Err(stak_vm::Error::InvalidMemoryAccess.into());
+        }
+
+        let null = memory.null()?;
+        let mut written = 0usize;
+        let mut cursor = (start < end)
+            .then(|| {
+                ListVectorCursor::<VECTOR_FACTOR>::new(
+                    memory,
+                    root.to_cons().ok_or(stak_vm::Error::ConsExpected)?,
+                    length,
+                    start,
+                )
+            })
+            .transpose()?;
+
+        while code_points != null {
+            let mut bytes = [0; 4];
+            let byte_count =
+                encode_utf8_code_point(Number::try_from(memory.car(code_points)?)?, &mut bytes)?;
+            if byte_count > end - start - written {
+                break;
+            }
+
+            for &byte in &bytes[..byte_count] {
+                let cell = cursor.as_mut().unwrap().next(memory)?;
+                memory.set_car(cell, Number::from_i64(i64::from(byte)).into())?;
+            }
+            written += byte_count;
+            code_points = memory
+                .cdr(code_points)?
+                .to_cons()
+                .ok_or(stak_vm::Error::ConsExpected)?;
+        }
+
+        let written = i64::try_from(written).map_err(|_| stak_vm::Error::NumberExpected)?;
+        let result = memory.allocate(code_points.into(), Number::from_i64(written).into())?;
+        memory.push(result.into())?;
+        Ok(())
+    }
+
+    fn utf8_decode<H: Heap>(memory: &mut Memory<H>) -> Result<(), Error> {
+        let [source, start, end, maximum, final_input, strict] = memory.pop_many()?;
+        let start = Self::nonnegative_integer(Number::try_from(start)?)?;
+        let end = Self::nonnegative_integer(Number::try_from(end)?)?;
+        let maximum = Self::nonnegative_integer(Number::try_from(maximum)?)?;
+        let (root, length) = bytevector_info(memory, source)?;
+        if start > end || end > length {
+            return Err(stak_vm::Error::InvalidMemoryAccess.into());
+        }
+
+        let final_input = final_input != memory.boolean(false)?.into();
+        let strict = strict != memory.boolean(false)?.into();
+        let input_length = (end - start).min(UTF8_BUFFER_SIZE);
+        let mut bytes = [0; UTF8_BUFFER_SIZE];
+        if input_length > 0 {
+            let root = root.to_cons().ok_or(stak_vm::Error::ConsExpected)?;
+            let mut cursor = ListVectorCursor::<VECTOR_FACTOR>::new(memory, root, length, start)?;
+            for byte in &mut bytes[..input_length] {
+                let cell = cursor.next(memory)?;
+                let value = Number::try_from(memory.car(cell)?)?.to_i64();
+                *byte = u8::try_from(value).map_err(|_| stak_vm::Error::NumberExpected)?;
+            }
+        }
+
+        let mut code_points = [0; UTF8_BUFFER_SIZE];
+        let mut code_point_count = 0;
+        let mut consumed = 0;
+        let mut invalid = false;
+
+        while consumed < input_length && code_point_count < maximum {
+            let byte = bytes[consumed];
+            let sequence_length = utf8_sequence_length(byte);
+            if sequence_length == 1 {
+                code_points[code_point_count] = u32::from(byte);
+                code_point_count += 1;
+                consumed += 1;
+                continue;
+            }
+
+            let available = input_length - consumed;
+            let prefix = &bytes[consumed..input_length.min(consumed + sequence_length)];
+            let has_invalid_continuation = sequence_length > 1
+                && prefix[1..]
+                    .iter()
+                    .any(|&byte| !(0x80..0xc0).contains(&byte));
+            let code_point = (sequence_length > 1 && available >= sequence_length)
+                .then(|| utf8_decode_sequence(&bytes[consumed..consumed + sequence_length]))
+                .flatten();
+
+            if code_point.is_none()
+                && sequence_length > 1
+                && available < sequence_length
+                && !final_input
+                && !has_invalid_continuation
+            {
+                break;
+            }
+
+            if let Some(code_point) = code_point {
+                code_points[code_point_count] = code_point;
+                code_point_count += 1;
+                consumed += sequence_length;
+            } else if strict {
+                invalid = true;
+                break;
+            } else {
+                code_points[code_point_count] = UTF8_REPLACEMENT_CODE_POINT;
+                code_point_count += 1;
+                consumed += 1;
+            }
+        }
+
+        if invalid {
+            memory.push(memory.boolean(false)?.into())?;
+            return Ok(());
+        }
+
+        let mut list = memory.null()?;
+        let mut has_code_points = false;
+        for &code_point in code_points[..code_point_count].iter().rev() {
+            list = memory.cons(Number::from_i64(i64::from(code_point)).into(), list)?;
+            if !has_code_points {
+                memory.push(list.into())?;
+                list = memory
+                    .top()?
+                    .to_cons()
+                    .ok_or(stak_vm::Error::ConsExpected)?;
+                has_code_points = true;
+            }
+        }
+        if !has_code_points {
+            memory.push(list.into())?;
+            list = memory
+                .top()?
+                .to_cons()
+                .ok_or(stak_vm::Error::ConsExpected)?;
+        }
+
+        let tail = memory
+            .top()?
+            .to_cons()
+            .ok_or(stak_vm::Error::ConsExpected)?;
+        let endpoints = memory.cons(list.into(), tail)?;
+        memory.set_top(endpoints.into())?;
+
+        let decoded =
+            i64::try_from(code_point_count).map_err(|_| stak_vm::Error::NumberExpected)?;
+        let consumed = i64::try_from(consumed).map_err(|_| stak_vm::Error::NumberExpected)?;
+        let counts = memory.allocate(
+            Number::from_i64(decoded).into(),
+            Number::from_i64(consumed).into(),
+        )?;
+        let endpoints = memory
+            .top()?
+            .to_cons()
+            .ok_or(stak_vm::Error::ConsExpected)?;
+        let result = memory.cons(endpoints.into(), counts)?;
+        memory.pop()?;
+        memory.push(result.into())?;
+        Ok(())
+    }
+}
+
+fn encode_utf8_code_point(number: Number, bytes: &mut [u8; 4]) -> Result<usize, Error> {
+    let code_point = code_point(number)?;
+    let character = char::from_u32(code_point).ok_or(stak_vm::Error::NumberExpected)?;
+    Ok(character.encode_utf8(bytes).len())
+}
+
+fn code_point(number: Number) -> Result<u32, Error> {
+    let float = number.to_f64();
+    let integer = number.to_i64();
+    if integer < 0 || float != integer as f64 {
+        return Err(stak_vm::Error::NumberExpected.into());
+    }
+    let code_point = u32::try_from(integer).map_err(|_| stak_vm::Error::NumberExpected)?;
+    if code_point > 0x10ffff || (0xd800..=0xdfff).contains(&code_point) {
+        return Err(stak_vm::Error::NumberExpected.into());
+    }
+
+    Ok(code_point)
+}
+
+const fn utf8_sequence_length(byte: u8) -> usize {
+    match byte {
+        0x00..=0x7f => 1,
+        0xc2..=0xdf => 2,
+        0xe0..=0xef => 3,
+        0xf0..=0xf4 => 4,
+        _ => 0,
+    }
+}
+
+fn utf8_decode_sequence(bytes: &[u8]) -> Option<u32> {
+    let continuation = |byte| (0x80..0xc0).contains(&byte);
+
+    match *bytes {
+        [byte] if byte < 0x80 => Some(u32::from(byte)),
+        [first, second] if (0xc2..0xe0).contains(&first) && continuation(second) => {
+            Some((u32::from(first & 0x1f) << 6) | u32::from(second & 0x3f))
+        }
+        [first, second, third]
+            if (0xe0..0xf0).contains(&first)
+                && continuation(second)
+                && continuation(third)
+                && (first != 0xe0 || second >= 0xa0)
+                && (first != 0xed || second < 0xa0) =>
+        {
+            Some(
+                (u32::from(first & 0x0f) << 12)
+                    | (u32::from(second & 0x3f) << 6)
+                    | u32::from(third & 0x3f),
+            )
+        }
+        [first, second, third, fourth]
+            if (0xf0..0xf5).contains(&first)
+                && continuation(second)
+                && continuation(third)
+                && continuation(fourth)
+                && (first != 0xf0 || second >= 0x90)
+                && (first != 0xf4 || second < 0x90) =>
+        {
+            Some(
+                (u32::from(first & 0x07) << 18)
+                    | (u32::from(second & 0x3f) << 12)
+                    | (u32::from(third & 0x3f) << 6)
+                    | u32::from(fourth & 0x3f),
+            )
+        }
+        _ => None,
     }
 }
 
@@ -225,49 +627,14 @@ fn bytevector_length<H: Heap>(memory: &Memory<H>, bytevector: Cons) -> Result<us
     usize::try_from(integer as u64).map_err(|_| stak_vm::Error::NumberExpected.into())
 }
 
-fn vector_cell<H: Heap>(
-    memory: &Memory<H>,
-    root: Value,
-    length: usize,
-    index: usize,
-) -> Result<Cons, Error> {
-    if index >= length {
-        return Err(stak_vm::Error::InvalidMemoryAccess.into());
-    }
-
-    let mut p = 1usize;
-    for _ in 0..vector_height(length) {
-        p = p
-            .checked_mul(VECTOR_FACTOR)
-            .ok_or(stak_vm::Error::InvalidMemoryAccess)?;
-    }
-
-    let mut list = root.to_cons().ok_or(stak_vm::Error::ConsExpected)?;
-    let mut index = index;
-    let mut first = true;
-    while p > 0 {
-        if !first {
-            list = memory
-                .car(list)?
-                .to_cons()
-                .ok_or(stak_vm::Error::ConsExpected)?;
-        }
-        list = memory.tail(list, index / p)?;
-        index %= p;
-        p /= VECTOR_FACTOR;
-        first = false;
-    }
-
-    Ok(list)
-}
-
 fn bytevector_get<H: Heap>(
     memory: &Memory<H>,
     root: Value,
     length: usize,
     index: usize,
 ) -> Result<u8, Error> {
-    let cell = vector_cell(memory, root, length, index)?;
+    let root = root.to_cons().ok_or(stak_vm::Error::ConsExpected)?;
+    let cell = list_vector_cell::<VECTOR_FACTOR, _>(memory, root, length, index)?;
     let value = Number::try_from(memory.car(cell)?)?.to_i64();
     u8::try_from(value).map_err(|_| stak_vm::Error::NumberExpected.into())
 }
@@ -279,7 +646,8 @@ fn bytevector_set<H: Heap>(
     index: usize,
     byte: u8,
 ) -> Result<(), Error> {
-    let cell = vector_cell(memory, root, length, index)?;
+    let root = root.to_cons().ok_or(stak_vm::Error::ConsExpected)?;
+    let cell = list_vector_cell::<VECTOR_FACTOR, _>(memory, root, length, index)?;
     memory.set_car(cell, Number::from_i64(i64::from(byte)).into())?;
     Ok(())
 }
@@ -388,6 +756,11 @@ impl<H: Heap, D: Device, F: FileSystem, P: ProcessContext, C: Clock> PrimitiveSe
             Primitive::HALT => return Err(Error::Halt),
             Primitive::MAKE_BYTEVECTOR => Self::make_bytevector(memory)?,
             Primitive::BYTEVECTOR_COPY => Self::bytevector_copy(memory)?,
+            Primitive::UTF8_ENCODED_LENGTH => Self::utf8_encoded_length(memory)?,
+            Primitive::UTF8_ENCODE => Self::utf8_encode(memory)?,
+            Primitive::UTF8_DECODE => Self::utf8_decode(memory)?,
+            Primitive::COPY_CODE_POINTS => Self::copy_code_points(memory)?,
+            Primitive::MAKE_STRING => Self::make_string(memory)?,
             Primitive::NULL | Primitive::PAIR => {
                 maybe_await!(self.type_check.operate(memory, primitive - Primitive::NULL))?
             }
@@ -510,6 +883,28 @@ mod tests {
         Ok(())
     }
 
+    fn decode_bytevector(
+        memory: &mut Memory<[Value; 50000]>,
+        source_index: usize,
+        start: usize,
+        end: usize,
+        maximum: usize,
+        final_input: bool,
+        strict: bool,
+    ) -> Value {
+        let source = stack_value(memory, source_index);
+        memory.push(source).unwrap();
+        memory.push(Number::from_i64(start as _).into()).unwrap();
+        memory.push(Number::from_i64(end as _).into()).unwrap();
+        memory.push(Number::from_i64(maximum as _).into()).unwrap();
+        let final_input = memory.boolean(final_input).unwrap();
+        memory.push(final_input.into()).unwrap();
+        let strict = memory.boolean(strict).unwrap();
+        memory.push(strict.into()).unwrap();
+        block_on!(primitive_set().operate(memory, Primitive::UTF8_DECODE)).unwrap();
+        memory.pop().unwrap()
+    }
+
     #[test]
     fn bytevector_copy_crosses_vector_boundaries() {
         let mut memory = Memory::new([Default::default(); 50000]).unwrap();
@@ -609,6 +1004,266 @@ mod tests {
         copy_bytevector(&mut memory, 0, 0, 1, 0, 0).unwrap();
         let destination = stack_value(&memory, 0);
         assert_eq!(bytevector_info(&memory, destination).unwrap().1, 0);
+    }
+
+    #[test]
+    fn utf8_codec_handles_multibyte_sequences() {
+        let mut memory = Memory::new([Default::default(); 50000]).unwrap();
+        let mut code_points = memory.null().unwrap();
+        for code_point in [65, 233, 12354].into_iter().rev() {
+            code_points = memory
+                .cons(Number::from_i64(code_point).into(), code_points)
+                .unwrap();
+        }
+        memory.push(code_points.into()).unwrap();
+
+        let destination = make_bytevector(&mut memory, 6, 0);
+        memory.push(destination).unwrap();
+        let code_points = stack_value(&memory, 1);
+        memory.push(code_points).unwrap();
+        let destination = stack_value(&memory, 1);
+        memory.push(destination).unwrap();
+        memory.push(Number::from_i64(0).into()).unwrap();
+        memory.push(Number::from_i64(6).into()).unwrap();
+        block_on!(primitive_set().operate(&mut memory, Primitive::UTF8_ENCODE)).unwrap();
+
+        let result = memory.pop().unwrap();
+        assert_eq!(
+            memory.car_value(result).unwrap(),
+            memory.null().unwrap().into()
+        );
+        assert_eq!(
+            Number::try_from(memory.cdr_value(result).unwrap())
+                .unwrap()
+                .to_i64(),
+            6
+        );
+        let destination = stack_value(&memory, 0);
+        let (root, length) = bytevector_info(&memory, destination).unwrap();
+        for (index, expected) in [65, 195, 169, 227, 129, 130].into_iter().enumerate() {
+            assert_eq!(
+                bytevector_get(&memory, root, length, index).unwrap(),
+                expected
+            );
+        }
+
+        let source = stack_value(&memory, 0);
+        memory.push(source).unwrap();
+        memory.push(Number::from_i64(0).into()).unwrap();
+        memory.push(Number::from_i64(6).into()).unwrap();
+        memory.push(Number::from_i64(64).into()).unwrap();
+        let true_value = memory.boolean(true).unwrap();
+        memory.push(true_value.into()).unwrap();
+        let true_value = memory.boolean(true).unwrap();
+        memory.push(true_value.into()).unwrap();
+        block_on!(primitive_set().operate(&mut memory, Primitive::UTF8_DECODE)).unwrap();
+
+        let result = memory.pop().unwrap();
+        let endpoints = memory.car_value(result).unwrap();
+        let counts = memory.cdr_value(result).unwrap();
+        assert_eq!(
+            Number::try_from(memory.cdr_value(counts).unwrap())
+                .unwrap()
+                .to_i64(),
+            6
+        );
+        assert_eq!(
+            Number::try_from(memory.car_value(counts).unwrap())
+                .unwrap()
+                .to_i64(),
+            3
+        );
+        let tail = memory.cdr_value(endpoints).unwrap().to_cons().unwrap();
+        assert_eq!(
+            Number::try_from(memory.car(tail).unwrap())
+                .unwrap()
+                .to_i64(),
+            12354
+        );
+        assert_eq!(memory.cdr(tail).unwrap(), memory.null().unwrap().into());
+        let mut list = memory.car_value(endpoints).unwrap().to_cons().unwrap();
+        for expected in [65, 233, 12354] {
+            assert_eq!(
+                Number::try_from(memory.car(list).unwrap())
+                    .unwrap()
+                    .to_i64(),
+                expected
+            );
+            list = memory.cdr(list).unwrap().to_cons().unwrap();
+        }
+        assert_eq!(list, memory.null().unwrap());
+    }
+
+    #[test]
+    fn utf8_decoder_rejects_malformed_sequences_without_panicking() {
+        for bytes in [
+            &[192, 128][..],
+            &[128],
+            &[226, 128],
+            &[237, 160, 128],
+            &[244, 144, 128, 128],
+            &[245, 128, 128, 128],
+        ] {
+            let mut memory = Memory::new([Default::default(); 50000]).unwrap();
+            let source = make_bytevector(&mut memory, bytes.len(), 0);
+            memory.push(source).unwrap();
+            let source = stack_value(&memory, 0);
+            let (root, length) = bytevector_info(&memory, source).unwrap();
+            for (index, &byte) in bytes.iter().enumerate() {
+                bytevector_set(&mut memory, root, length, index, byte).unwrap();
+            }
+
+            let result = decode_bytevector(&mut memory, 0, 0, bytes.len(), 64, true, true);
+            assert_eq!(result, memory.boolean(false).unwrap().into());
+        }
+    }
+
+    #[test]
+    fn utf8_decoder_defers_an_incomplete_nonfinal_sequence() {
+        let mut memory = Memory::new([Default::default(); 50000]).unwrap();
+        let source = make_bytevector(&mut memory, 3, 0);
+        memory.push(source).unwrap();
+        let source = stack_value(&memory, 0);
+        let (root, length) = bytevector_info(&memory, source).unwrap();
+        for (index, byte) in [227, 129, 130].into_iter().enumerate() {
+            bytevector_set(&mut memory, root, length, index, byte).unwrap();
+        }
+
+        let result = decode_bytevector(&mut memory, 0, 0, 2, 64, false, true);
+        let endpoints = memory.car_value(result).unwrap();
+        let counts = memory.cdr_value(result).unwrap();
+        assert_eq!(
+            memory.car_value(endpoints).unwrap(),
+            memory.null().unwrap().into()
+        );
+        assert_eq!(
+            Number::try_from(memory.cdr_value(counts).unwrap())
+                .unwrap()
+                .to_i64(),
+            0
+        );
+
+        let result = decode_bytevector(&mut memory, 0, 0, 3, 64, true, true);
+        let endpoints = memory.car_value(result).unwrap();
+        let counts = memory.cdr_value(result).unwrap();
+        assert_eq!(
+            Number::try_from(memory.cdr_value(counts).unwrap())
+                .unwrap()
+                .to_i64(),
+            3
+        );
+        let code_points = memory.car_value(endpoints).unwrap().to_cons().unwrap();
+        assert_eq!(
+            Number::try_from(memory.car(code_points).unwrap())
+                .unwrap()
+                .to_i64(),
+            12354
+        );
+        assert_eq!(
+            memory.cdr(code_points).unwrap(),
+            memory.null().unwrap().into()
+        );
+    }
+
+    #[test]
+    fn copy_code_points_returns_an_independent_prefix_and_remainder() {
+        let mut memory = Memory::new([Default::default(); 50000]).unwrap();
+        let mut source = memory.null().unwrap();
+        for code_point in [65, 66, 67].into_iter().rev() {
+            source = memory
+                .cons(Number::from_i64(code_point).into(), source)
+                .unwrap();
+        }
+        memory.push(source.into()).unwrap();
+
+        let source = stack_value(&memory, 0);
+        memory.push(source).unwrap();
+        memory.push(Number::from_i64(2).into()).unwrap();
+        block_on!(primitive_set().operate(&mut memory, Primitive::COPY_CODE_POINTS)).unwrap();
+
+        let result = memory.pop().unwrap();
+        let string = memory.car_value(result).unwrap();
+        assert_eq!(
+            Number::try_from(memory.car_value(string).unwrap())
+                .unwrap()
+                .to_i64(),
+            2
+        );
+        assert_eq!(memory.cdr_value(string).unwrap().tag(), STRING_TAG);
+
+        let metadata = memory.cdr_value(result).unwrap();
+        let tail = memory.car_value(metadata).unwrap().to_cons().unwrap();
+        let remainder = memory.cdr_value(metadata).unwrap().to_cons().unwrap();
+        let copied = memory.cdr_value(string).unwrap().to_cons().unwrap();
+        assert_eq!(
+            Number::try_from(memory.car(copied).unwrap())
+                .unwrap()
+                .to_i64(),
+            65
+        );
+        assert_eq!(
+            Number::try_from(memory.car(tail).unwrap())
+                .unwrap()
+                .to_i64(),
+            66
+        );
+        assert_eq!(
+            Number::try_from(memory.car(remainder).unwrap())
+                .unwrap()
+                .to_i64(),
+            67
+        );
+
+        memory.set_car(copied, Number::from_i64(90).into()).unwrap();
+        let source = stack_value(&memory, 0).to_cons().unwrap();
+        assert_eq!(
+            Number::try_from(memory.car(source).unwrap())
+                .unwrap()
+                .to_i64(),
+            65
+        );
+    }
+
+    #[test]
+    fn make_string_preserves_the_list_backed_representation() {
+        let mut memory = Memory::new([Default::default(); 64]).unwrap();
+        memory.push(Number::from_i64(3).into()).unwrap();
+        memory.push(Number::from_i64(233).into()).unwrap();
+
+        block_on!(primitive_set().operate(&mut memory, Primitive::MAKE_STRING)).unwrap();
+
+        let string = memory.pop().unwrap();
+        assert_eq!(
+            Number::try_from(memory.car_value(string).unwrap())
+                .unwrap()
+                .to_i64(),
+            3
+        );
+        assert_eq!(memory.cdr_value(string).unwrap().tag(), STRING_TAG);
+
+        let mut code_points = memory.cdr_value(string).unwrap().to_cons().unwrap();
+        for _ in 0..3 {
+            assert_eq!(
+                Number::try_from(memory.car(code_points).unwrap())
+                    .unwrap()
+                    .to_i64(),
+                233
+            );
+            code_points = memory.cdr(code_points).unwrap().to_cons().unwrap();
+        }
+        assert_eq!(code_points, memory.null().unwrap());
+    }
+
+    #[test]
+    fn make_string_rejects_an_invalid_code_point() {
+        let mut memory = Memory::new([Default::default(); 64]).unwrap();
+        memory.push(Number::from_i64(1).into()).unwrap();
+        memory.push(Number::from_i64(0x110000).into()).unwrap();
+
+        assert_eq!(
+            block_on!(primitive_set().operate(&mut memory, Primitive::MAKE_STRING)),
+            Err(Error::Vm(stak_vm::Error::NumberExpected))
+        );
     }
 
     #[test]

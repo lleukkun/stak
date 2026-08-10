@@ -492,3 +492,194 @@ The quiet rerun completed successfully after the earlier CPU-loaded run. Relativ
 - The full workspace test invocation was not completed because it exceeded the available interactive run time; the focused suites and release integration build passed.
 
 All changes remain uncommitted for review.
+
+## 2026-08-09 - Bulk textual string I/O
+
+- Routed `read-string` through existing `port-bulk-read` callbacks when the input port has no buffered bytes, using bounded 64-byte chunks, incremental UTF-8 decoding, replacement behavior matching scalar `read-char`, and restoration of unread bytes when the requested character count is reached.
+- Routed `write-string` through existing `port-bulk-write` callbacks using bounded 64-byte UTF-8 chunks; ports without bulk callbacks retain the scalar character path, and output ports may receive chunks split across UTF-8 sequences without losing decoder state.
+- Added regressions for in-memory chunk boundaries, malformed UTF-8 replacement and unread-byte preservation, bulk-only output callback dispatch, and OS-backed UTF-8 string round trips.
+
+### Validation
+
+- Workspace compiler check, formatting, and `git diff --check`: passed.
+- R7RS primitive tests: **7 passed**.
+- Filesystem std tests: **14 passed**.
+- Filesystem libc tests: **11 passed**.
+- Compiler unit tests: **6 passed**; compiler doctests: **2 passed**.
+- Feature-matrix checks for R7RS async, filesystem std, and filesystem libc: passed.
+- Port feature suite: **52 scenarios / 162 steps passed**.
+- File feature suite: **21 scenarios / 81 steps passed**.
+- String feature suite: **165 scenarios / 495 steps passed**.
+- Combined bytevector and port suites: **132 scenarios / 432 steps passed**.
+
+### Locked string benchmark
+
+Command:
+
+```text
+TMPDIR=$PWD/target/bench-tmp GOTMPDIR=$PWD/target/bench-tmp cargo bench -p stak-bench --bench io --locked -- --sample-size 10 --warm-up-time 0.2 --measurement-time 0.5 'io/(in-memory-port|os-file).*string'
+```
+
+For a 100,000-character payload, the fresh median throughputs were:
+
+- In-memory ASCII read: **409.39 KiB/s**.
+- In-memory ASCII write: **598.40 KiB/s**.
+- In-memory UTF-8 (`é`) read: **365.32 KiB/s**.
+- In-memory UTF-8 (`é`) write: **475.50 KiB/s**.
+- OS ASCII read: **925.56 KiB/s**.
+- OS ASCII write: **1.2770 MiB/s**.
+- OS UTF-8 (`é`) read: **685.01 KiB/s**.
+- OS UTF-8 (`é`) write: **1.4124 MiB/s**.
+
+The OS UTF-8 paths improved materially over their prior baselines; the in-memory paths now use the same bounded bulk boundary but remain dominated by Scheme-level in-memory encoding/decoding work. All changes remain uncommitted for review.
+
+## 2026-08-10 - Native UTF-8 and shared vector traversal
+
+- Added a shared VM cursor for list-backed tree vectors. Adjacent accesses now follow leaf-list links and only descend from the root at 64-cell boundaries; native file I/O and forward bytevector copies use the same traversal logic.
+- Added streaming native UTF-8 length, encode, and decode primitives. Encoding reports both the remaining code-point list and bytes written; decoding reports code points and bytes consumed, defers incomplete non-final suffixes, preserves replacement decoding, and rejects malformed strict input.
+- Routed `string->utf8`, `utf8->string`, and byte-backed textual bulk I/O through the native codecs while retaining bounded buffers and unread-byte restoration.
+- Extended ports with optional textual read/write callbacks without changing the existing five-argument `make-port` contract or scalar/bulk callback positions. In-memory string ports use the textual path when their byte decoder has no pending partial sequence and fall back through byte-bulk or scalar dispatch otherwise.
+- Increased native file batches to 1024 bytes and in-memory bytevector output chunks to 256 bytes.
+- Added regressions for native codec validity and incomplete input, forced-GC relocation, direct textual dispatch, declined-callback fallback, zero-length reads, pending partial UTF-8 state, malformed input, and tree/chunk boundaries.
+
+### Validation
+
+- Existing release-test compiler bootstrap of `prelude.scm`: passed.
+- Compiler unit tests: **6 passed**.
+- R7RS primitive tests: **10 passed** in both normal and `gc_always` configurations.
+- Filesystem std tests: **14 passed**; libc tests: **11 passed**.
+- Port feature suite: **57 scenarios / 177 steps passed**.
+- Combined string and file feature suites: **187 scenarios / 579 steps passed**.
+- No-default filesystem check, R7RS async check, root std check, formatting, focused Clippy with warnings denied, and `git diff --check`: passed.
+- The `compile_r7rs` compiler doctest was stopped after exceeding 60 seconds; the focused compiler and bootstrap checks above completed successfully.
+
+### Locked focused I/O benchmark
+
+Command:
+
+```text
+TMPDIR=$PWD/target/bench-tmp GOTMPDIR=$PWD/target/bench-tmp cargo bench -p stak-bench --bench io --locked -- --sample-size 10 --warm-up-time 0.2 --measurement-time 0.5 'io/(in-memory-port|os-file)(/utf8)?/(read-string|write-string|read-bytevector|write-bytevector)/100000'
+```
+
+Fresh median throughputs for the 100,000-element cases were:
+
+- In-memory bytevector read: **84.273 MiB/s**; write: **44.104 MiB/s**.
+- In-memory ASCII string read: **3.1963 MiB/s**; write: **8.7652 MiB/s**.
+- In-memory UTF-8 string read: **6.3290 MiB/s**; write: **17.564 MiB/s**.
+- OS bytevector read: **127.19 MiB/s**; write: **120.99 MiB/s**.
+- OS ASCII string read: **10.646 MiB/s**; write: **12.517 MiB/s**.
+- OS UTF-8 string read: **16.205 MiB/s**; write: **23.281 MiB/s**.
+
+The native codecs remove the Scheme-level per-byte arithmetic bottleneck, while the shared cursor also materially improves bytevector traversal. All changes remain uncommitted for review.
+
+## 2026-08-10 - Native string copying and operation-only I/O timing
+
+- Added native bounded code-point copying for in-memory string ports. Input reads now return an independent exact-length string and a remainder cursor; output writes append an independent copy, fixing the previous source-aliasing bug.
+- Extended native UTF-8 decode results with the decoded count and both list endpoints. Scheme joins decoded chunks destructively and constructs the final string with its known length, avoiding repeated `length`, `reverse`, and `append` traversals and their extra list allocations.
+- Increased the native codec buffer from 64 to 512 bytes and replaced per-sequence `core::str::from_utf8` calls with direct UTF-8 validation and decoding. The decoder still rejects overlong encodings, surrogates, out-of-range code points, and malformed strict input, while non-strict port decoding retains replacement behavior.
+- Updated the codec-boundary feature to split multibyte input at the new 512-byte boundary and added a regression proving that an output string cannot mutate its source.
+- Split throughput benchmark preparation from the measured operation with a benchmark-only VM gate. Source creation (`make-string` or `make-bytevector`), VM initialization, and port creation happen before Criterion starts timing; the existing `/prepare/` groups continue to measure that setup explicitly. A failed setup now reports an error instead of waiting indefinitely at the gate.
+
+### Validation
+
+- R7RS primitive tests: **11 passed** in normal and `gc_always` configurations.
+- Compiler unit tests: **6 passed**.
+- Combined string and port feature suites: **224 scenarios / 678 steps passed**.
+- Root std check, R7RS no-default-features check, focused Clippy with warnings denied, formatting, benchmark compilation, and `git diff --check`: passed.
+
+### Complete operation-only I/O benchmark
+
+Command:
+
+```text
+TMPDIR=$PWD/target/bench-tmp GOTMPDIR=$PWD/target/bench-tmp cargo bench -p stak-bench --bench io --locked -- --sample-size 10 --warm-up-time 0.2 --measurement-time 0.5
+```
+
+The complete 48-case run finished successfully. Criterion central estimates for the 100,000-element payload operations were:
+
+- In-memory bytevector read: **132.18 MiB/s**; write: **54.224 MiB/s**.
+- In-memory ASCII string read: **210.98 MiB/s**; write: **211.44 MiB/s**.
+- In-memory UTF-8 (`é`) string read: **418.76 MiB/s**; write: **423.16 MiB/s**.
+- OS bytevector read: **204.55 MiB/s**; write: **267.51 MiB/s**.
+- OS ASCII string read: **102.96 MiB/s**; write: **130.21 MiB/s**.
+- OS UTF-8 (`é`) string read: **98.828 MiB/s**; write: **172.32 MiB/s**.
+
+The separate source-constructing 100,000-character string preparation cases measured approximately **7.15-7.38 ms**, while operation-only in-memory string reads and writes measured approximately **0.45 ms**. Unlike earlier benchmark results, the throughput denominator now excludes VM initialization, bytecode startup, `make-string` or `make-bytevector`, and port construction/opening. It still includes output retrieval for in-memory ports and close/flush for file operations. Therefore the earlier end-to-end and new operation-only throughput values are not direct speedup comparisons; their difference combines implementation improvements with the narrower timed region. This initial operation-only snapshot was later superseded in `io-benchmark-results-operation-only.txt` by the clean post-native-`make-string` rerun recorded below; the earlier end-to-end `io-benchmark-results.txt` remains unchanged.
+
+All changes remain uncommitted for review.
+
+## 2026-08-10 - Native `make-string`
+
+- Added primitive `606` as a native filled-string constructor, matching the role of native `make-bytevector` while preserving the existing `(length . tagged-code-point-list)` representation.
+- Kept the public Scheme procedure and its optional fill-character behavior unchanged. The wrapper converts the fill character to a code point; the native primitive validates the length and Unicode scalar, allocates the code-point list while keeping its root visible to the collector, and constructs the tagged string directly.
+- Reused the UTF-8 codec's Unicode scalar validation instead of creating a second validity rule.
+- Added native representation and invalid-code-point tests. The allocation test passes with `gc_always`, and the existing zero-length, default-fill, explicit-fill, mutation, conversion, and 512-byte codec-boundary scenarios continue to pass.
+
+### Validation
+
+- R7RS primitive tests: **13 passed** in normal and `gc_always` configurations.
+- String feature suite: **166 scenarios / 498 steps passed**.
+- Compiler unit tests: **6 passed**.
+- R7RS no-default-features check, focused Clippy with warnings denied, formatting, release-test build, and `git diff --check`: passed.
+
+### Focused preparation benchmark
+
+Command:
+
+```text
+TMPDIR=$PWD/target/bench-tmp GOTMPDIR=$PWD/target/bench-tmp cargo bench -p stak-bench --bench io --locked -- --sample-size 10 --warm-up-time 0.2 --measurement-time 0.5 '^io/(in-memory-port|os-file)(/utf8)?/prepare/(read-string|write-string)/(10000|100000)$'
+```
+
+Criterion central estimates for 100,000-character preparation changed as follows:
+
+- In-memory ASCII input: **7.1609 ms -> 0.41971 ms**; output: **7.1464 ms -> 0.43018 ms**.
+- In-memory UTF-8 (`é`) input: **7.1765 ms -> 0.41989 ms**; output: **7.1740 ms -> 0.66513 ms**. The UTF-8 output sample was visibly noisy, with a **0.583-0.752 ms** interval.
+- OS ASCII output: **7.3778 ms -> 0.46187 ms**.
+- OS UTF-8 (`é`) output: **7.3690 ms -> 0.46241 ms**.
+- OS input preparation does not construct a string and remained approximately unchanged at **0.32098 ms** for ASCII and **0.31969 ms** for UTF-8.
+
+The clean 100,000-character cases show roughly a **16-17x** reduction in source-constructing preparation time. The final representation still contains one cons cell per character, so the remaining approximately **0.42-0.46 ms** is primarily the required native allocation work plus VM and port setup.
+
+### Clean complete benchmark rerun
+
+The complete 48-case benchmark was rerun after native `make-string` so every preparation and payload estimate comes from one build and Criterion process. The command was the same locked 10-sample profile used for the earlier complete run.
+
+Criterion central estimates for the 100,000-element payload operations were:
+
+- In-memory bytevector read: **135.18 MiB/s**; write: **55.175 MiB/s**.
+- In-memory ASCII string read: **222.94 MiB/s**; write: **222.51 MiB/s**.
+- In-memory UTF-8 (`é`) string read: **443.02 MiB/s**; write: **440.82 MiB/s**.
+- OS bytevector read: **207.37 MiB/s**; write: **267.77 MiB/s**.
+- OS ASCII string read: **103.43 MiB/s**; write: **146.60 MiB/s**.
+- OS UTF-8 (`é`) string read: **99.519 MiB/s**; write: **187.77 MiB/s**.
+
+The clean 100,000-character in-memory ASCII preparation estimates were **0.41375 ms** for input and **0.42419 ms** for output. UTF-8 input was **0.41215 ms**; UTF-8 output was noisier at **0.71868 ms** with a **0.601-0.768 ms** interval. Several OS preparation-only samples were likewise noisy, while payload intervals remained tight. The complete tables in `io-benchmark-results-operation-only.txt` now contain only this post-native-`make-string` run; the temporary mixed-run follow-up note was removed.
+
+All changes remain uncommitted for review.
+
+## 2026-08-10 - Operation-only benchmark measurement review
+
+- Replaced Criterion's small-input batching with sequential custom iterations. Each payload iteration now owns exactly one prepared VM, worker thread, and set of port resources, instead of retaining a batch of suspended 32 MiB VM heaps and open ports.
+- Moved payload timing into the VM worker. The clock starts after the benchmark gate receives its resume signal and stops when the remaining bytecode finishes, excluding channel handoff, worker wake-up, and thread join from the reported duration.
+- Renamed the existing in-memory textual-callback scenario and added a true byte-bulk string-read regression. The new case splits a three-byte UTF-8 character at byte 511 of the 512-byte codec buffer and verifies that bytes read ahead are restored for the next `read-string` call.
+- Documented that `ListVectorCursor` stores direct heap locations and is valid only with the same allocation-free `Memory` between cursor operations.
+
+### Validation
+
+- Port feature suite: **59 scenarios / 183 steps passed**.
+- R7RS primitive tests: **13 passed** in normal and `gc_always` configurations.
+- Filesystem unit tests: **4 passed**.
+- Benchmark compilation, no-default filesystem check, formatting, and `git diff --check`: passed.
+
+### Clean worker-timed I/O benchmark
+
+The complete 48-case locked benchmark was rerun with the same 10-sample fast profile. Criterion central estimates for the 100,000-element payload operations were:
+
+- In-memory bytevector read: **137.87 MiB/s**; write: **55.481 MiB/s**.
+- In-memory ASCII string read: **231.95 MiB/s**; write: **231.58 MiB/s**.
+- In-memory UTF-8 (`é`) string read: **465.87 MiB/s**; write: **464.04 MiB/s**.
+- OS bytevector read: **220.72 MiB/s**; write: **261.53 MiB/s**.
+- OS ASCII string read: **107.41 MiB/s**; write: **134.71 MiB/s**.
+- OS UTF-8 (`é`) string read: **101.68 MiB/s**; write: **186.23 MiB/s**.
+
+The 10,000-element cases improved most after removing the fixed synchronization and join cost from the measured interval; the 100,000-element cases changed less. The refreshed `io-benchmark-results-operation-only.txt` contains the complete preparation and payload tables from this worker-timed run. All changes remain uncommitted for review.

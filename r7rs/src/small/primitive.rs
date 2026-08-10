@@ -57,6 +57,11 @@ pub(super) enum Primitive {
     Atan,
     MakeBytevector = 600,
     BytevectorCopy,
+    Utf8EncodedLength,
+    Utf8Encode,
+    Utf8Decode,
+    CopyCodePoints,
+    MakeString,
 }
 
 impl Primitive {
@@ -117,4 +122,9 @@ impl Primitive {
     pub const ATAN: usize = Self::Atan as _;
     pub const MAKE_BYTEVECTOR: usize = Self::MakeBytevector as _;
     pub const BYTEVECTOR_COPY: usize = Self::BytevectorCopy as _;
+    pub const UTF8_ENCODED_LENGTH: usize = Self::Utf8EncodedLength as _;
+    pub const UTF8_ENCODE: usize = Self::Utf8Encode as _;
+    pub const UTF8_DECODE: usize = Self::Utf8Decode as _;
+    pub const COPY_CODE_POINTS: usize = Self::CopyCodePoints as _;
+    pub const MAKE_STRING: usize = Self::MakeString as _;
 }

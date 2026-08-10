@@ -161,6 +161,36 @@ Feature: File
       | foo.txt | A      |
       | bar.txt | B      |
 
+  Scenario: Round-trip UTF-8 strings through file ports
+    Given a file named "main.scm" with:
+      """scheme
+      (import (scheme base) (scheme file))
+
+      (define expected "Aあ😄Z")
+      (define input (open-input-file "input.txt"))
+      (define actual (read-string 4 input))
+      (close-input-port input)
+
+      (define output (open-output-file "output.txt"))
+      (write-string actual output)
+      (close-output-port output)
+
+      (define round-trip
+        (call-with-input-file "output.txt"
+          (lambda (port) (read-string 4 port))))
+
+      (write-u8 (if (and (equal? actual expected)
+                         (equal? round-trip expected))
+                    65
+                    66))
+      """
+    And a file named "input.txt" with:
+      """text
+      Aあ😄Z
+      """
+    When I successfully run `stak main.scm`
+    Then the stdout should contain exactly "A"
+
   Scenario: Flush a file
     Given a file named "main.scm" with:
       """scheme

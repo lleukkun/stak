@@ -414,6 +414,228 @@ Feature: Port
     When I successfully run `stak main.scm`
     Then the stdout should contain exactly "A"
 
+  Scenario: Read string input through a textual callback without losing characters
+    Given a file named "main.scm" with:
+      """scheme
+      (import (scheme base))
+
+      (define source (string-append (make-string 63 #\\a) "あ😄Z"))
+      (define port (open-input-string source))
+      (define first (read-string 64 port))
+      (define second (read-string 2 port))
+
+      (write-u8
+        (if (and (= (string-length first) 64)
+                 (equal? first (string-append (make-string 63 #\\a) "あ"))
+                 (equal? second "😄Z"))
+            65
+            66))
+      """
+    When I successfully run `stak main.scm`
+    Then the stdout should contain exactly "A"
+
+  Scenario: Read string input through byte bulk chunks across the codec boundary
+    Given a file named "main.scm" with:
+      """scheme
+      (import (scheme base))
+
+      (define prefix (make-string 511 #\\a))
+      (define source (string->utf8 (string-append prefix "あZW")))
+      (define port (open-input-bytevector source))
+      (define first (read-string 512 port))
+      (define second (read-string 2 port))
+
+      (write-u8
+        (if (and (equal? first (string-append prefix "あ"))
+                 (equal? second "ZW"))
+            65
+            66))
+      """
+    When I successfully run `stak main.scm`
+    Then the stdout should contain exactly "A"
+
+  Scenario: Fall back from textual input after a partial UTF-8 byte read
+    Given a file named "main.scm" with:
+      """scheme
+      (import (scheme base))
+
+      (define port (open-input-string "éZ"))
+      (define first (read-u8 port))
+      (define rest (read-string 2 port))
+
+      (write-u8
+        (if (and (= first 195) (equal? rest "�Z"))
+            65
+            66))
+      """
+    When I successfully run `stak main.scm`
+    Then the stdout should contain exactly "A"
+
+  Scenario: Preserve malformed UTF-8 replacement behavior across bulk reads
+    Given a file named "main.scm" with:
+      """scheme
+      (import (scheme base))
+
+      (define port (open-input-bytevector #u8(226 130 65)))
+      (define first (read-string 1 port))
+      (define second (read-string 2 port))
+
+      (write-u8
+        (if (and (equal? first "�")
+                 (equal? second "�A"))
+            65
+            66))
+      """
+    When I successfully run `stak main.scm`
+    Then the stdout should contain exactly "A"
+
+  Scenario: Use bulk callbacks for string output
+    Given a file named "main.scm" with:
+      """scheme
+      (import (scheme base) (stak io))
+
+      (define bytes '())
+      (define port
+        (make-port
+          #f
+          (lambda (byte) (error "scalar write used"))
+          #f
+          #f
+          #f
+          #f
+          (lambda (xs start end)
+            (do ((index start (+ index 1)))
+              ((>= index end) #f)
+              (set! bytes (cons (bytevector-u8-ref xs index) bytes))))))
+
+      (write-string (string-append (make-string 63 #\\a) "あ😄") port)
+      (define actual (list->bytevector (reverse bytes)))
+      (write-u8
+        (if (equal? actual (string->utf8 (string-append (make-string 63 #\\a) "あ😄")))
+            65
+            66))
+      """
+    When I successfully run `stak main.scm`
+    Then the stdout should contain exactly "A"
+
+  @stak
+  Scenario: Use textual bulk callbacks without scalar byte dispatch
+    Given a file named "main.scm" with:
+      """scheme
+      (import (scheme base) (stak io))
+
+      (define written #f)
+      (define port
+        (make-port
+          (lambda () (error "scalar read used"))
+          (lambda (byte) (error "scalar write used"))
+          (lambda () #f)
+          (lambda () #f)
+          '()
+          #f
+          #f
+          (lambda (count) "AB")
+          (lambda (xs)
+            (set! written xs)
+            #t)))
+
+      (define read (read-string 2 port))
+      (write-string "CD" port)
+      (write-u8
+        (if (and (equal? read "AB") (equal? written "CD"))
+            65
+            66))
+      """
+    When I successfully run `stak main.scm`
+    Then the stdout should contain exactly "A"
+
+  @stak
+  Scenario: Fall back from a declined textual read to byte bulk dispatch
+    Given a file named "main.scm" with:
+      """scheme
+      (import (scheme base) (stak io))
+
+      (define source '#u8(65 66))
+      (define port
+        (make-port
+          (lambda () (error "scalar read used"))
+          #f
+          #f
+          (lambda () #f)
+          '()
+          (lambda (destination start end)
+            (let ((count (min (- end start) (bytevector-length source))))
+              (bytevector-copy! destination start source 0 count)
+              (set! source (bytevector-copy source count))
+              count))
+          #f
+          (lambda (count) #f)))
+
+      (write-u8 (if (equal? (read-string 2 port) "AB") 65 66))
+      """
+    When I successfully run `stak main.scm`
+    Then the stdout should contain exactly "A"
+
+  Scenario: Empty string reads do not probe scalar input
+    Given a file named "main.scm" with:
+      """scheme
+      (import (scheme base) (stak io))
+
+      (define calls 0)
+      (define port
+        (make-input-port
+          (lambda ()
+            (set! calls (+ calls 1))
+            65)
+          (lambda () #f)))
+
+      (define empty (read-string 0 port))
+      (define byte (read-u8 port))
+      (write-u8
+        (if (and (equal? empty "") (= byte 65) (= calls 1))
+            65
+            66))
+      """
+    When I successfully run `stak main.scm`
+    Then the stdout should contain exactly "A"
+
+  Scenario: Fall back from textual output with a pending UTF-8 prefix
+    Given a file named "main.scm" with:
+      """scheme
+      (import (scheme base))
+
+      (define port (open-output-string))
+      (write-u8 226 port)
+      (write-string "A" port)
+
+      (write-u8
+        (if (equal? (get-output-string port) "�A")
+            65
+            66))
+      """
+    When I successfully run `stak main.scm`
+    Then the stdout should contain exactly "A"
+
+  Scenario: String output does not alias its source
+    Given a file named "main.scm" with:
+      """scheme
+      (import (scheme base))
+
+      (define source (string-copy "A"))
+      (define port (open-output-string))
+      (write-string source port)
+      (write-string "B" port)
+
+      (write-u8
+        (if (and (equal? (string->utf8 source) #u8(65))
+                 (= (string-length source) 1)
+                 (equal? (get-output-string port) "AB"))
+            65
+            66))
+      """
+    When I successfully run `stak main.scm`
+    Then the stdout should contain exactly "A"
+
   Scenario: Retrieve string output incrementally without rescanning
     Given a file named "main.scm" with:
       """scheme

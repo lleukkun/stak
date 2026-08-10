@@ -4,12 +4,12 @@ mod primitive;
 pub use self::primitive::Primitive;
 use crate::{FileError, FileSystem};
 pub use error::PrimitiveError;
-use stak_vm::{Cons, Error, Heap, Memory, Number, PrimitiveSet, Value};
+use stak_vm::{Cons, Error, Heap, ListVectorCursor, Memory, Number, PrimitiveSet, Value};
 use winter_maybe_async::maybe_async;
 
 const BYTEVECTOR_TAG: u16 = 8;
 const VECTOR_FACTOR: usize = 64;
-const BULK_BUFFER_SIZE: usize = 64;
+const BULK_BUFFER_SIZE: usize = 1024;
 
 fn nonnegative_integer(value: Value) -> Result<usize, Error> {
     let number = Number::try_from(value)?;
@@ -43,72 +43,6 @@ fn bytevector_range<H: Heap>(
 
     let root = root.to_cons().ok_or(Error::ConsExpected)?;
     Ok((root, length, start, end))
-}
-
-const fn vector_height(mut length: usize) -> usize {
-    let mut height = 0;
-
-    while length > VECTOR_FACTOR {
-        length = 1 + (length - 1) / VECTOR_FACTOR;
-        height += 1;
-    }
-
-    height
-}
-
-fn vector_cell<H: Heap>(
-    memory: &Memory<H>,
-    root: Cons,
-    length: usize,
-    index: usize,
-) -> Result<Cons, Error> {
-    if index >= length {
-        return Err(Error::InvalidMemoryAccess);
-    }
-
-    let mut p = 1usize;
-    for _ in 0..vector_height(length) {
-        p = p
-            .checked_mul(VECTOR_FACTOR)
-            .ok_or(Error::InvalidMemoryAccess)?;
-    }
-
-    let mut list = root;
-    let mut index = index;
-    let mut first = true;
-    while p > 0 {
-        if !first {
-            list = memory.car(list)?.to_cons().ok_or(Error::ConsExpected)?;
-        }
-        list = memory.tail(list, index / p)?;
-        index %= p;
-        p /= VECTOR_FACTOR;
-        first = false;
-    }
-
-    Ok(list)
-}
-
-fn bytevector_get<H: Heap>(
-    memory: &Memory<H>,
-    root: Cons,
-    length: usize,
-    index: usize,
-) -> Result<u8, Error> {
-    let cell = vector_cell(memory, root, length, index)?;
-    let value = Number::try_from(memory.car(cell)?)?.to_i64();
-    u8::try_from(value).map_err(|_| Error::NumberExpected)
-}
-
-fn bytevector_set<H: Heap>(
-    memory: &mut Memory<H>,
-    root: Cons,
-    length: usize,
-    index: usize,
-    byte: u8,
-) -> Result<(), Error> {
-    let cell = vector_cell(memory, root, length, index)?;
-    memory.set_car(cell, Number::from_i64(byte as _).into())
 }
 
 /// A primitive set for a file system.
@@ -214,6 +148,9 @@ impl<T: FileSystem, H: Heap> PrimitiveSet<H> for FilePrimitiveSet<T> {
                 let (root, length, start, end) = bytevector_range(memory, bytevector, start, end)?;
                 let mut offset = start;
                 let mut count = 0;
+                let mut cursor = (start < end)
+                    .then(|| ListVectorCursor::<VECTOR_FACTOR>::new(memory, root, length, start))
+                    .transpose()?;
 
                 while offset < end {
                     let size = (end - offset).min(BULK_BUFFER_SIZE);
@@ -223,8 +160,9 @@ impl<T: FileSystem, H: Heap> PrimitiveSet<H> for FilePrimitiveSet<T> {
                         .read_into(descriptor, &mut buffer[..size])
                         .map_err(|_| FileError::Read)?;
 
-                    for (index, &byte) in buffer[..read].iter().enumerate() {
-                        bytevector_set(memory, root, length, offset + index, byte)?;
+                    for &byte in &buffer[..read] {
+                        let cell = cursor.as_mut().unwrap().next(memory)?;
+                        memory.set_car(cell, Number::from_i64(byte as _).into())?;
                     }
 
                     offset += read;
@@ -241,13 +179,18 @@ impl<T: FileSystem, H: Heap> PrimitiveSet<H> for FilePrimitiveSet<T> {
                 let descriptor = Number::try_from(descriptor)?.to_i64() as _;
                 let (root, length, start, end) = bytevector_range(memory, bytevector, start, end)?;
                 let mut offset = start;
+                let mut cursor = (start < end)
+                    .then(|| ListVectorCursor::<VECTOR_FACTOR>::new(memory, root, length, start))
+                    .transpose()?;
 
                 while offset < end {
                     let size = (end - offset).min(BULK_BUFFER_SIZE);
                     let mut buffer = [0; BULK_BUFFER_SIZE];
 
-                    for (index, byte) in buffer[..size].iter_mut().enumerate() {
-                        *byte = bytevector_get(memory, root, length, offset + index)?;
+                    for byte in &mut buffer[..size] {
+                        let cell = cursor.as_mut().unwrap().next(memory)?;
+                        let value = Number::try_from(memory.car(cell)?)?.to_i64();
+                        *byte = u8::try_from(value).map_err(|_| Error::NumberExpected)?;
                     }
 
                     self.file_system

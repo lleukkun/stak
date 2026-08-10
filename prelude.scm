@@ -1718,6 +1718,8 @@
     list->string
     string->code-points
     code-points->string
+    code-points->string/length
+    native-copy-code-points
     string->list
     string-append
     string-fill!
@@ -1770,8 +1772,13 @@
     (define string-length car)
     (define string->code-points cdr)
 
+    (define (code-points->string/length xs length)
+      (string-rib xs length))
+
     (define (code-points->string xs)
-      (data-rib string-type (length xs) xs))
+      (code-points->string/length xs (length xs)))
+
+    (define native-copy-code-points (primitive 605))
 
     (define (string-append . xs)
       (code-points->string (apply append (map string->code-points xs))))
@@ -1826,9 +1833,9 @@
         ((or (null? xs) (<= count 0)))
         (set-car! xs x)))
 
+    (define $make-string (primitive 606))
     (define (make-string length . rest)
-      (code-points->string
-        (make-list length (if (null? rest) 0 (char->integer (car rest))))))
+      ($make-string length (if (null? rest) 0 (char->integer (car rest)))))
 
     (define (string-for-each f xs)
       (for-each f (string->list xs)))
@@ -2041,10 +2048,18 @@
     utf8-code-point
     decode-utf8-bytes-replacement
     decode-utf8-bytes-strict
-    encode-utf8-code-points)
+    encode-utf8-code-points
+    native-utf8-buffer-size
+    native-utf8-encoded-length
+    native-utf8-encode!
+    native-utf8-decode)
   (import (stak base))
   (begin
     (define utf8-replacement-code-point 65533)
+    (define native-utf8-buffer-size 512)
+    (define native-utf8-encoded-length (primitive 602))
+    (define native-utf8-encode! (primitive 603))
+    (define native-utf8-decode (primitive 604))
 
     (define (utf8-sequence-length byte)
       (cond
@@ -2252,7 +2267,8 @@
     ; Port
 
     (define-record-type port
-      (make-port-record read write flush close data bulk-read bulk-write)
+      (make-port-record
+        read write flush close data bulk-read bulk-write text-read text-write)
       port?
       (read port-read port-set-read!)
       (write port-write port-set-write!)
@@ -2260,7 +2276,15 @@
       (close port-close port-set-close!)
       (data port-data port-set-data!)
       (bulk-read port-bulk-read port-set-bulk-read!)
-      (bulk-write port-bulk-write port-set-bulk-write!))
+      (bulk-write port-bulk-write port-set-bulk-write!)
+      (text-read port-text-read port-set-text-read!)
+      (text-write port-text-write port-set-text-write!))
+
+    (define (port-option options index)
+      (cond
+        ((null? options) #f)
+        ((zero? index) (car options))
+        (else (port-option (cdr options) (- index 1)))))
 
     (define (make-port read write flush close data . rest)
       (make-port-record
@@ -2269,8 +2293,10 @@
         flush
         close
         data
-        (if (pair? rest) (car rest) #f)
-        (if (and (pair? rest) (pair? (cdr rest))) (cadr rest) #f)))
+        (port-option rest 0)
+        (port-option rest 1)
+        (port-option rest 2)
+        (port-option rest 3)))
 
     (define input-port? port-read)
     (define output-port? port-write)
@@ -2284,8 +2310,10 @@
         #f
         close
         '()
-        (if (pair? rest) (car rest) #f)
-        (if (and (pair? rest) (pair? (cdr rest))) (cadr rest) #f)))
+        (port-option rest 0)
+        (port-option rest 1)
+        (port-option rest 2)
+        (port-option rest 3)))
 
     (define (make-output-port write flush close . rest)
       (make-port
@@ -2293,11 +2321,11 @@
         write
         flush
         close
-        (if (null? rest) #f (car rest))
-        (if (and (pair? rest) (pair? (cdr rest))) (cadr rest) #f)
-        (if (and (pair? rest) (pair? (cdr rest)) (pair? (cddr rest)))
-          (car (cddr rest))
-          #f)))
+        (port-option rest 0)
+        (port-option rest 1)
+        (port-option rest 2)
+        (port-option rest 3)
+        (port-option rest 4)))
 
     (define current-input-port
       (make-parameter
@@ -2336,7 +2364,9 @@
             port-set-close!
             port-set-data!
             port-set-bulk-read!
-            port-set-bulk-write!))))
+            port-set-bulk-write!
+            port-set-text-read!
+            port-set-text-write!))))
 
     (define close-input-port close-port)
     (define close-output-port close-port)
@@ -2421,15 +2451,115 @@
           (not (eof-object? (peek-char port)))
           (eof-object? (peek-u8 port)))))
 
+    (define port-bulk-buffer-size native-utf8-buffer-size)
+
+    (define (read-string-bulk count port bulk-read)
+      (define buffer (make-bytevector port-bulk-buffer-size 0))
+      (define index 0)
+      (define buffer-length 0)
+      (define code-points '())
+      (define code-points-tail '())
+      (define code-point-count 0)
+
+      (define (compact-buffer!)
+        (let ((pending (- buffer-length index)))
+          (when (positive? pending)
+            (bytevector-copy! buffer 0 buffer index buffer-length))
+          (set! index 0)
+          (set! buffer-length pending)))
+
+      (define (fill-buffer! remaining)
+        (compact-buffer!)
+        (let* ((capacity (- port-bulk-buffer-size buffer-length))
+               (requested (min capacity (+ remaining 3)))
+               (read
+                 (bulk-read
+                   buffer
+                   buffer-length
+                   (+ buffer-length requested))))
+          (set! buffer-length (+ buffer-length read))
+          read))
+
+      (define (restore-buffer!)
+        (define bytes
+          (let loop ((at (- buffer-length 1)) (bytes '()))
+            (if (< at index)
+              bytes
+              (loop
+                (- at 1)
+                (cons (bytevector-u8-ref buffer at) bytes)))))
+        (unless (null? bytes)
+          (port-set-data! port (append bytes (port-data port))))
+        (set! index buffer-length))
+
+      (define (finish)
+        (restore-buffer!)
+        (code-points->string/length code-points code-point-count))
+
+      (define (accept-decoded! result)
+        (let* ((endpoints (car result))
+               (chunk (car endpoints))
+               (chunk-tail (cdr endpoints))
+               (counts (cdr result)))
+          (unless (null? chunk)
+            (if (null? code-points)
+              (set! code-points chunk)
+              (set-cdr! code-points-tail chunk))
+            (set! code-points-tail chunk-tail))
+          (set! index (+ index (cdr counts)))
+          (set! code-point-count (+ code-point-count (car counts)))
+          counts))
+
+      (let loop ((remaining count))
+        (if (zero? remaining)
+          (finish)
+          (begin
+            (when (= index buffer-length)
+              (fill-buffer! remaining))
+            (if (= index buffer-length)
+              (finish)
+              (let* ((result
+                       (native-utf8-decode
+                         buffer index buffer-length remaining #f #f))
+                     (counts (accept-decoded! result))
+                     (decoded (car counts))
+                     (consumed (cdr counts)))
+                (if (positive? consumed)
+                  (loop (- remaining decoded))
+                  (if (positive? (fill-buffer! remaining))
+                    (loop remaining)
+                    (let ((result
+                            (native-utf8-decode
+                              buffer index buffer-length remaining #t #f)))
+                      (accept-decoded! result)
+                      (finish))))))))))
+
     (define (read-string count . rest)
       (define port (get-input-port rest))
+      (define text-read
+        (and
+          (positive? count)
+          (null? (port-data port))
+          (port-text-read port)))
+      (define bulk-read
+        (and
+          (positive? count)
+          (null? (port-data port))
+          (port-bulk-read port)))
 
-      (list->string
-        (let loop ((count count))
-          (let ((x (read-char port)))
-            (if (or (eof-object? x) (zero? count))
-              '()
-              (cons x (loop (- count 1))))))))
+      (let ((text (and text-read (text-read count))))
+        (cond
+          (text text)
+          (bulk-read (read-string-bulk count port bulk-read))
+          (else
+            (list->string
+              (let loop ((count count))
+                (if (zero? count)
+                  '()
+                  (let ((x (read-char port)))
+                    (if (eof-object? x)
+                      '()
+                      (cons x (loop (- count 1))))))))))))
 
     (define (read-line . rest)
       (define port (get-input-port rest))
@@ -2545,11 +2675,30 @@
           x
           (lambda (byte) (write-u8 byte port)))))
 
+    (define (write-string-bulk x bulk-write)
+      (define buffer (make-bytevector port-bulk-buffer-size 0))
+
+      (let loop ((code-points (string->code-points x)))
+        (unless (null? code-points)
+          (let* ((result
+                   (native-utf8-encode!
+                     code-points buffer 0 port-bulk-buffer-size))
+                 (remaining (car result))
+                 (count (cdr result)))
+            (bulk-write buffer 0 count)
+            (loop remaining)))))
+
     (define (write-string x . rest)
-      (let ((port (get-output-port rest)))
-        (for-each
-          (lambda (x) (write-char x port))
-          (string->list x))))
+      (let* ((port (get-output-port rest))
+             (text-write (port-text-write port))
+             (bulk-write (port-bulk-write port)))
+        (cond
+          ((and text-write (text-write x)) #f)
+          (bulk-write (write-string-bulk x bulk-write))
+          (else
+            (for-each
+              (lambda (x) (write-char x port))
+              (string->list x))))))
 
     (define (write-bytevector xs . rest)
       (define port (get-output-port rest))
@@ -2613,7 +2762,19 @@
                     (bytevector-u8-set! destination at byte)
                     (loop (+ at 1)))
                   (- at start))))))
-        (make-input-port read-byte (lambda () #f) read-bulk)))
+        (define (read-text count)
+          (and
+            (null? ys)
+            (let* ((result (native-copy-code-points xs count))
+                   (metadata (cdr result)))
+              (set! xs (cdr metadata))
+              (car result))))
+        (make-input-port
+          read-byte
+          (lambda () #f)
+          read-bulk
+          #f
+          read-text)))
 
     (define (append-output-string-char result tail char)
       (set-car! result (+ 1 (string-length result)))
@@ -2660,13 +2821,29 @@
           (do ((at start (+ at 1)))
             ((>= at end) #f)
             (consume (bytevector-u8-ref xs at))))
+        (define (write-text xs)
+          (and
+            (null? pending)
+            (let* ((copy-result
+                     (native-copy-code-points
+                       (string->code-points xs)
+                       (string-length xs)))
+                   (copy (car copy-result))
+                   (copy-tail (car (cdr copy-result))))
+              (when (positive? (string-length copy))
+                (set-car! result (+ (string-length result) (string-length copy)))
+                (set-cdr! tail (string->code-points copy))
+                (set! tail copy-tail))
+              #t)))
         (make-output-port
           consume
           (lambda () #f)
           (lambda () #f)
           (lambda () result)
           #f
-          write-bulk)))
+          write-bulk
+          #f
+          write-text)))
 
     (define (get-output-string port)
       (let ((get (port-data port)))
@@ -2688,7 +2865,7 @@
             count))
         (make-input-port read-byte (lambda () #f) read-bulk)))
 
-    (define bytevector-output-chunk-size 64)
+    (define bytevector-output-chunk-size 256)
 
     (define (open-output-bytevector)
       (let ((chunks '())
@@ -2748,14 +2925,36 @@
 
   (begin
     (define (string->utf8 xs)
-      (list->bytevector
-        (encode-utf8-code-points (string->code-points xs))))
+      (let* ((code-points (string->code-points xs))
+             (length (native-utf8-encoded-length code-points))
+             (bytes (make-bytevector length 0)))
+        (native-utf8-encode! code-points bytes 0 length)
+        bytes))
 
     (define (utf8->string xs)
-      (let ((code-points (decode-utf8-bytes-strict (bytevector->list xs))))
-        (if code-points
-          (code-points->string code-points)
-          (error "invalid UTF-8 byte sequence" xs))))))
+      (let ((length (bytevector-length xs)))
+        (let loop ((start 0) (code-points '()) (tail '()) (count 0))
+          (if (= start length)
+            (code-points->string/length code-points count)
+            (let* ((end (min length (+ start native-utf8-buffer-size)))
+                   (result
+                     (native-utf8-decode
+                       xs start end native-utf8-buffer-size (= end length) #t)))
+              (if result
+                (let* ((endpoints (car result))
+                       (chunk (car endpoints))
+                       (chunk-tail (cdr endpoints))
+                       (counts (cdr result)))
+                  (unless (null? chunk)
+                    (if (null? code-points)
+                      (set! code-points chunk)
+                      (set-cdr! tail chunk)))
+                  (loop
+                    (+ start (cdr counts))
+                    code-points
+                    (if (null? chunk) tail chunk-tail)
+                    (+ count (car counts))))
+                (error "invalid UTF-8 byte sequence" xs)))))))))
 
 (define-library (stak continue)
   (export

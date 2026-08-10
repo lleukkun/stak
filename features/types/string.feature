@@ -455,6 +455,26 @@ Feature: String
       | —        |
       | 😄       |
 
+  Scenario: Convert UTF-8 across native codec chunk boundaries
+    Given a file named "main.scm" with:
+      """scheme
+      (import (scheme base))
+
+      (define source
+        (string-append
+          (make-string 511 #\a)
+          "あ"
+          (make-string 511 #\b)
+          "😄"))
+
+      (write-u8
+        (if (equal? (utf8->string (string->utf8 source)) source)
+            65
+            66))
+      """
+    When I successfully run `stak main.scm`
+    Then the stdout should contain exactly "A"
+
   Scenario Outline: Convert a string case
     Given a file named "main.scm" with:
       """scheme
